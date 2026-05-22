@@ -1,0 +1,98 @@
+name: Build Valhalla Tiles
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Geofabrik region extract (e.g. us/california/norcal)'
+        required: true
+        default: 'us/california/norcal'
+        type: string
+  schedule:
+    - cron: '0 6 1 * *'
+
+concurrency:
+  group: tile-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-tiles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set region
+        id: region
+        run: |
+          REGION="${{ github.event.inputs.region || 'us/california/norcal' }}"
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          echo "Building tiles for: $REGION"
+
+      - name: Download OSM extract
+        run: |
+          REGION="${{ steps.region.outputs.region }}"
+          FILENAME=$(echo "$REGION" | tr '/' '-')-latest.osm.pbf
+          URL="https://download.geofabrik.de/${REGION}-latest.osm.pbf"
+          echo "Downloading $URL..."
+          curl -L -o "$FILENAME" "$URL"
+          echo "OSM_FILE=$FILENAME" >> $GITHUB_ENV
+          ls -lh "$FILENAME"
+
+      - name: Build Valhalla tiles
+        run: |
+          mkdir -p valhalla_tiles
+
+          docker run --rm \
+            -v "$(pwd):/data" \
+            ghcr.io/valhalla/valhalla:latest \
+            valhalla_build_config \
+            --mjolnir-tile-dir /data/valhalla_tiles \
+            > valhalla.json
+
+          docker run --rm \
+            -v "$(pwd):/data" \
+            ghcr.io/valhalla/valhalla:latest \
+            valhalla_build_tiles \
+            -c /data/valhalla.json \
+            /data/${{ env.OSM_FILE }}
+
+          echo "Tile build complete!"
+          find valhalla_tiles -name "*.gph" | wc -l
+          du -sh valhalla_tiles/
+
+      - name: Prepare tiles for deployment
+        run: |
+          mkdir -p deploy
+          cp -r valhalla_tiles/* deploy/ 2>/dev/null || true
+
+          echo "GhostRoute Valhalla Tiles" > deploy/index.html
+          echo "<pre>" >> deploy/index.html
+          echo "Region: ${{ steps.region.outputs.region }}" >> deploy/index.html
+          echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> deploy/index.html
+          echo "" >> deploy/index.html
+          echo "Tile counts:" >> deploy/index.html
+          for level in 0 1 2; do
+            count=$(find deploy/$level -name "*.gph" 2>/dev/null | wc -l)
+            echo "  Level $level: $count tiles" >> deploy/index.html
+          done
+          echo "" >> deploy/index.html
+          total=$(find deploy -name "*.gph" | wc -l)
+          size=$(du -sh deploy/ | cut -f1)
+          echo "Total: $total tiles ($size)" >> deploy/index.html
+          echo "</pre>" >> deploy/index.html
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./deploy
+          force_orphan: true
+          commit_message: "Tiles built from ${{ steps.region.outputs.region }}"
