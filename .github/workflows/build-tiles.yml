@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       region:
-        description: 'Geofabrik region extract (e.g. us/california/norcal)'
+        description: 'Geofabrik region path (e.g. north-america/us/california/norcal)'
         required: true
-        default: 'us/california/norcal'
+        default: 'north-america/us/california/norcal'
         type: string
   schedule:
     - cron: '0 6 1 * *'
@@ -32,7 +32,7 @@ jobs:
       - name: Set region
         id: region
         run: |
-          REGION="${{ github.event.inputs.region || 'us/california/norcal' }}"
+          REGION="${{ github.event.inputs.region || 'north-america/us/california/norcal' }}"
           echo "region=$REGION" >> $GITHUB_OUTPUT
           echo "Building tiles for: $REGION"
 
