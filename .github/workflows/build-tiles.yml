@@ -1,98 +1,255 @@
-name: Build Valhalla Tiles
+name: Build Valhalla Tile Packs (all US states)
+
+# What this does:
+#   1. Reads states.json from the repo root.
+#   2. Runs a matrix job per state: downloads the Geofabrik OSM extract,
+#      runs valhalla_build_tiles in the official Valhalla Docker image,
+#      packs the result into a .tar.
+#   3. Uploads every state's .tar as an asset on the same GitHub Release,
+#      tagged with the run date (e.g. v2026.05.24).
+#   4. After all state builds finish, generates catalog.json from
+#      states.json plus the per-asset sizes/sha256, and uploads it to the
+#      same release.
+#
+# The GhostRoute app fetches catalog.json on launch, picks the state pack
+# matching the user's GPS via point-in-polygon, and downloads the matching
+# .tar asset. Catalog URL is stable:
+#   https://github.com/badasteroid/ghostroute-tiles/releases/latest/download/catalog.json
+#
+# Cost: GitHub Actions on public repos is free. Each state job takes
+# 5-30 min wall time depending on state size; 50 states run in parallel
+# (up to GitHub's free concurrent-job cap), so total wall time is 1-3 hr.
+# Zero local resources used.
 
 on:
   workflow_dispatch:
     inputs:
-      region:
-        description: 'Geofabrik region path (e.g. north-america/us/california/norcal)'
-        required: true
-        default: 'north-america/us/california/norcal'
-        type: string
+      states:
+        description: 'Comma-separated state ids to build (default: all from states.json)'
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'states.json'
+      - '.github/workflows/build-tiles.yml'
   schedule:
+    # 06:00 UTC on the 1st of each month — rebuild against latest OSM data.
     - cron: '0 6 1 * *'
+
+permissions:
+  contents: write
 
 concurrency:
   group: tile-build
   cancel-in-progress: false
 
-permissions:
-  contents: write
-  pages: write
-  id-token: write
-
 jobs:
-  build-tiles:
+  # Compute the release tag once so every matrix job uploads to the same
+  # release. Also fan out the matrix from states.json (filtered if the
+  # caller passed a states= input).
+  init:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.tag.outputs.tag }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute release tag
+        id: tag
+        run: |
+          # Use UTC date so a single workflow run produces one release
+          # tag even if the catalog job lands on a different calendar day.
+          TAG="v$(date -u +%Y.%m.%d)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag for this run: $TAG"
+
+      - name: Build matrix from states.json (filtered if caller passed states=)
+        id: matrix
+        run: |
+          FILTER='${{ github.event.inputs.states }}'
+          if [ -z "$FILTER" ]; then
+            # All states.
+            MATRIX=$(jq -c '{include: .regions}' states.json)
+          else
+            # Filter to the comma-separated ids the caller passed.
+            MATRIX=$(jq -c --arg ids "$FILTER" '
+              ($ids | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $wanted
+              | {include: [.regions[] | select(.id as $i | $wanted | index($i))]}
+            ' states.json)
+          fi
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Matrix:"
+          echo "$MATRIX" | jq .
+
+  # Ensure the release exists before any uploads (action-gh-release will
+  # create it on first upload, but doing it up-front avoids race conditions
+  # between matrix jobs trying to create the same tag simultaneously).
+  prepare-release:
+    needs: init
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create or update release shell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.init.outputs.release_tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — reusing."
+          else
+            gh release create "$TAG" \
+              --title "Tile packs $TAG" \
+              --notes "Built from latest Geofabrik extracts. See catalog.json for the list of available state packs."
+          fi
+
+  build:
+    needs: [init, prepare-release]
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 10  # GitHub free orgs get up to 20 concurrent; 10 leaves headroom.
+      matrix: ${{ fromJSON(needs.init.outputs.matrix) }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set region
-        id: region
+      - name: Free disk space (states can be 1-3 GB raw)
         run: |
-          REGION="${{ github.event.inputs.region || 'north-america/us/california/norcal' }}"
-          echo "region=$REGION" >> $GITHUB_OUTPUT
-          echo "Building tiles for: $REGION"
+          # GitHub-hosted runners have ~14 GB free by default. Big states
+          # (CA, TX) plus Docker images can push us over. Strip what we
+          # don't need before downloading the PBF.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
 
       - name: Download OSM extract
         run: |
-          REGION="${{ steps.region.outputs.region }}"
-          FILENAME=$(echo "$REGION" | tr '/' '-')-latest.osm.pbf
-          URL="https://download.geofabrik.de/${REGION}-latest.osm.pbf"
-          echo "Downloading $URL..."
-          curl -L -o "$FILENAME" "$URL"
-          echo "OSM_FILE=$FILENAME" >> $GITHUB_ENV
-          ls -lh "$FILENAME"
+          URL="https://download.geofabrik.de/${{ matrix.path }}-latest.osm.pbf"
+          echo "Downloading $URL"
+          curl -fL --retry 3 --retry-delay 5 -o region.osm.pbf "$URL"
+          ls -lh region.osm.pbf
 
       - name: Build Valhalla tiles
         run: |
           mkdir -p valhalla_tiles
-
-          docker run --rm \
-            -v "$(pwd):/data" \
-            ghcr.io/valhalla/valhalla:latest \
+          # Generate the config first (writes to stdout, redirect to file).
+          docker run --rm -v "$PWD:/data" ghcr.io/valhalla/valhalla:latest \
             valhalla_build_config \
-            --mjolnir-tile-dir /data/valhalla_tiles \
+              --mjolnir-tile-dir /data/valhalla_tiles \
             > valhalla.json
+          # Then build the tiles. This is the long step.
+          docker run --rm -v "$PWD:/data" ghcr.io/valhalla/valhalla:latest \
+            valhalla_build_tiles -c /data/valhalla.json /data/region.osm.pbf
+          # Sanity: did anything come out?
+          COUNT=$(find valhalla_tiles -name '*.gph' -type f | wc -l)
+          echo "Produced $COUNT .gph tile files"
+          test "$COUNT" -gt 0
 
-          docker run --rm \
-            -v "$(pwd):/data" \
-            ghcr.io/valhalla/valhalla:latest \
-            valhalla_build_tiles \
-            -c /data/valhalla.json \
-            /data/${{ env.OSM_FILE }}
-
-          echo "Tile build complete!"
-          find valhalla_tiles -name "*.gph" | wc -l
-          du -sh valhalla_tiles/
-
-      - name: Prepare tiles for deployment
+      - name: Pack tiles into tar
+        id: pack
         run: |
-          mkdir -p deploy
-          cp -r valhalla_tiles/* deploy/ 2>/dev/null || true
+          ASSET="ghostroute_${{ matrix.id }}_tiles.tar"
+          cd valhalla_tiles
+          # Numeric level dirs only (skip stray files).
+          shopt -s nullglob
+          DIRS=([0-9] [0-9][0-9])
+          shopt -u nullglob
+          tar cf "../$ASSET" "${DIRS[@]}"
+          cd ..
+          SIZE=$(stat -c%s "$ASSET")
+          SHA=$(sha256sum "$ASSET" | cut -d' ' -f1)
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          # GitHub Release single-asset limit is 2 GB. If we exceed, fail
+          # loudly here rather than silently truncating uploads.
+          if [ "$SIZE" -gt 2147483647 ]; then
+            echo "::error::Pack ${{ matrix.id }} is ${SIZE} bytes > 2 GB GitHub Release limit. Split with Geofabrik subregions or osmium."
+            exit 1
+          fi
+          ls -lh "$ASSET"
 
-          echo "GhostRoute Valhalla Tiles" > deploy/index.html
-          echo "<pre>" >> deploy/index.html
-          echo "Region: ${{ steps.region.outputs.region }}" >> deploy/index.html
-          echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> deploy/index.html
-          echo "" >> deploy/index.html
-          echo "Tile counts:" >> deploy/index.html
-          for level in 0 1 2; do
-            count=$(find deploy/$level -name "*.gph" 2>/dev/null | wc -l)
-            echo "  Level $level: $count tiles" >> deploy/index.html
-          done
-          echo "" >> deploy/index.html
-          total=$(find deploy -name "*.gph" | wc -l)
-          size=$(du -sh deploy/ | cut -f1)
-          echo "Total: $total tiles ($size)" >> deploy/index.html
-          echo "</pre>" >> deploy/index.html
+      - name: Upload pack to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.init.outputs.release_tag }}"
+          # --clobber so reruns replace the prior asset cleanly.
+          gh release upload "$TAG" \
+            "${{ steps.pack.outputs.asset }}" \
+            --clobber
 
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Record per-pack metadata for catalog
+        run: |
+          mkdir -p pack-meta
+          jq -n \
+            --arg id    "${{ matrix.id }}" \
+            --arg name  "${{ matrix.name }}" \
+            --arg asset "${{ steps.pack.outputs.asset }}" \
+            --argjson size "${{ steps.pack.outputs.size }}" \
+            --arg sha   "${{ steps.pack.outputs.sha256 }}" \
+            --argjson bbox '${{ toJSON(matrix.bbox) }}' \
+            '{id:$id, name:$name, asset:$asset, sizeBytes:$size, sha256:$sha, bbox:$bbox}' \
+            > "pack-meta/${{ matrix.id }}.json"
+
+      - uses: actions/upload-artifact@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./deploy
-          force_orphan: true
-          commit_message: "Tiles built from ${{ steps.region.outputs.region }}"
+          name: pack-meta-${{ matrix.id }}
+          path: pack-meta/${{ matrix.id }}.json
+          retention-days: 1
+
+  # After every build has either succeeded or failed (if: always() — we
+  # still emit a catalog covering only the packs that made it).
+  catalog:
+    needs: [init, build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: pack-meta
+          pattern: pack-meta-*
+          merge-multiple: true
+
+      - name: Generate catalog.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.init.outputs.release_tag }}"
+          REPO="${{ github.repository }}"
+
+          # Read every per-pack metadata file the build jobs uploaded.
+          # Each is a single JSON object. Merge into the catalog.
+          PACKS_JSON=$(jq -s '.' pack-meta/*.json 2>/dev/null || echo '[]')
+
+          # Compose the download URL per pack — these are stable links
+          # under the release tag. The /latest/download/ alias gives us
+          # a tag-agnostic URL too, but we put the tag-specific URL in
+          # the catalog so the app's version checks are unambiguous.
+          jq -n \
+            --arg version "$TAG" \
+            --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg repo "$REPO" \
+            --argjson packs "$PACKS_JSON" \
+            '{
+              version: $version,
+              generatedAt: $generated,
+              packs: ($packs | map(. + {
+                version: $version,
+                url: "https://github.com/\($repo)/releases/download/\($version)/\(.asset)"
+              }))
+            }' > catalog.json
+
+          echo "Generated catalog with $(jq '.packs | length' catalog.json) packs"
+          jq . catalog.json | head -50
+
+      - name: Upload catalog.json to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.init.outputs.release_tag }}"
+          gh release upload "$TAG" catalog.json --clobber
