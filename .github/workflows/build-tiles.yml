@@ -136,27 +136,64 @@ jobs:
             (24.0,-130.0,72.0,-64.0);
           out body;'
 
-          # Retry with backoff if Overpass returns 503/504. The community-
-          # hosted endpoints rate-limit; usually a single retry after 30s
-          # is enough.
-          for attempt in 1 2 3 4 5; do
-            echo "Overpass attempt ${attempt}/5..."
+          # Header notes (post-mortem 2026-05-27): the first iteration of
+          # this step sent curl's defaults — Accept: */* and User-Agent:
+          # curl/X.Y.Z — and got HTTP 406 on every attempt from
+          # overpass-api.de within ~300 ms. That's a front-door
+          # rejection (NGINX/proxy filtering on UA + Accept signatures
+          # commonly associated with scrapers), not a query problem.
+          # Setting both explicitly fixes it:
+          #   - User-Agent: identifies the CI client so the operator can
+          #     contact us if our usage causes issues.
+          #   - Accept: application/json: matches the query's [out:json]
+          #     directive; eliminates content-negotiation ambiguity.
+          UA="ghostroute-tiles-ci/1.0 (+https://github.com/badasteroid/ghostroute-tiles)"
+
+          # Endpoint rotation. overpass-api.de is the canonical
+          # community instance; kumi.systems is the community mirror
+          # we fall back to when the main hits rate limits or has an
+          # outage. The retry loop tries main 3 times, then mirror 2
+          # times, before failing.
+          ENDPOINTS=(
+            'https://overpass-api.de/api/interpreter'
+            'https://overpass-api.de/api/interpreter'
+            'https://overpass-api.de/api/interpreter'
+            'https://overpass.kumi.systems/api/interpreter'
+            'https://overpass.kumi.systems/api/interpreter'
+          )
+
+          attempt=0
+          for endpoint in "${ENDPOINTS[@]}"; do
+            attempt=$((attempt + 1))
+            echo "Overpass attempt ${attempt}/${#ENDPOINTS[@]} against ${endpoint}..."
             HTTP_CODE=$(curl -sS \
               --max-time 700 \
+              -A "$UA" \
+              -H 'Accept: application/json' \
               -o overpass-raw.json \
               -w '%{http_code}' \
               -X POST \
-              'https://overpass-api.de/api/interpreter' \
+              "$endpoint" \
               --data-urlencode "data=${QUERY}")
             echo "  HTTP ${HTTP_CODE}"
             if [ "$HTTP_CODE" = "200" ] && [ -s overpass-raw.json ]; then
+              echo "  success — ${endpoint}"
               break
             fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "::error::Overpass failed after 5 attempts (last HTTP=$HTTP_CODE)"
+            # Show a head of the response body on non-200 to aid future
+            # diagnosis (HTML error pages, JSON error envelopes, etc.).
+            if [ -s overpass-raw.json ]; then
+              echo "  --- response head (first 500 chars) ---"
+              head -c 500 overpass-raw.json || true
+              echo
+              echo "  --- end response head ---"
+            fi
+            if [ "$attempt" -eq "${#ENDPOINTS[@]}" ]; then
+              echo "::error::Overpass failed across ${#ENDPOINTS[@]} attempts (last HTTP=$HTTP_CODE)"
               exit 1
             fi
-            sleep $((30 * attempt))
+            # Exponential-ish backoff: 15s, 30s, 60s, 120s.
+            sleep $((15 * attempt))
           done
 
           RAW_SIZE=$(stat -c%s overpass-raw.json 2>/dev/null || stat -f%z overpass-raw.json)
