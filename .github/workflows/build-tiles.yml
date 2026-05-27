@@ -1,25 +1,29 @@
-name: Build Valhalla Tile Packs (all US states)
+name: Build Valhalla Tile Packs (all US states, skip-if-unchanged)
 
 # What this does:
 #   1. Reads states.json from the repo root.
-#   2. Runs a matrix job per state: downloads the Geofabrik OSM extract,
-#      runs valhalla_build_tiles in the official Valhalla Docker image,
-#      packs the result into a .tar.
-#   3. Uploads every state's .tar as an asset on the same GitHub Release,
-#      tagged with the run date (e.g. v2026.05.24).
-#   4. After all state builds finish, generates catalog.json from
-#      states.json plus the per-asset sizes/sha256, and uploads it to the
-#      same release.
+#   2. Runs a matrix job per state. Each job first checks Geofabrik's
+#      Last-Modified header against the existing GitHub Release asset's
+#      updated_at — if the upstream PBF hasn't changed since we last
+#      built that state, the job exits early without rebuilding.
+#   3. For states that DO need rebuilding, runs valhalla_build_tiles
+#      in Docker and uploads the new .tar to the stable "tiles-latest"
+#      release with --clobber so the URL stays the same.
+#   4. After all matrix jobs, regenerates catalog.json from the current
+#      state of the release. Per-pack `version` is the asset's
+#      updated_at timestamp — unchanged packs keep the same version,
+#      so the app's per-pack version comparison naturally skips them.
 #
-# The GhostRoute app fetches catalog.json on launch, picks the state pack
-# matching the user's GPS via point-in-polygon, and downloads the matching
-# .tar asset. Catalog URL is stable:
-#   https://github.com/badasteroid/ghostroute-tiles/releases/latest/download/catalog.json
+# Result: the FIRST run takes 2–3 hours (everything new). Subsequent
+# runs where 0–5 states changed take 10–30 minutes — most state jobs
+# exit early after a HEAD request, only the changed ones actually
+# build. A "nothing changed" run finishes in well under 10 minutes
+# (the entire matrix becomes "echo skip" jobs).
 #
-# Cost: GitHub Actions on public repos is free. Each state job takes
-# 5-30 min wall time depending on state size; 50 states run in parallel
-# (up to GitHub's free concurrent-job cap), so total wall time is 1-3 hr.
-# Zero local resources used.
+# The app's `routingTilePackService.ts` does not need any changes —
+# it already compares its locally-stored `installedVersion` to the
+# catalog's per-pack `version` string. Timestamps work as well as
+# tags here.
 
 on:
   workflow_dispatch:
@@ -28,14 +32,23 @@ on:
         description: 'Comma-separated state ids to build (default: all from states.json)'
         required: false
         default: ''
+      force_rebuild:
+        description: 'Rebuild every state, ignoring the skip-if-unchanged check'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
   push:
     branches: [main]
     paths:
       - 'states.json'
       - '.github/workflows/build-tiles.yml'
   schedule:
-    # 06:00 UTC on the 1st of each month — rebuild against latest OSM data.
-    - cron: '0 6 1 * *'
+    # Quarterly rebuild — first of Jan/Apr/Jul/Oct at 06:00 UTC.
+    # Monthly was overkill: road networks barely change month-over-
+    # month, and the per-state skip check makes manual reruns cheap
+    # any time fresh OSM data lands.
+    - cron: '0 6 1 1,4,7,10 *'
 
 permissions:
   contents: write
@@ -44,164 +57,362 @@ concurrency:
   group: tile-build
   cancel-in-progress: false
 
+env:
+  # Stable release tag — every run uploads with --clobber so the URL
+  # is permanent. The app fetches catalog.json from
+  # https://github.com/<owner>/<repo>/releases/latest/download/catalog.json
+  # which resolves to whichever release is most recent; we only have
+  # one, so it always resolves to this tag.
+  RELEASE_TAG: tiles-latest
+
 jobs:
-  # Compute the release tag once so every matrix job uploads to the same
-  # release. Also fan out the matrix from states.json (filtered if the
-  # caller passed a states= input).
   init:
     runs-on: ubuntu-latest
     outputs:
-      release_tag: ${{ steps.tag.outputs.tag }}
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Compute release tag
-        id: tag
-        run: |
-          # Use UTC date so a single workflow run produces one release
-          # tag even if the catalog job lands on a different calendar day.
-          TAG="v$(date -u +%Y.%m.%d)"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release tag for this run: $TAG"
-
       - name: Build matrix from states.json (filtered if caller passed states=)
         id: matrix
         run: |
           FILTER='${{ github.event.inputs.states }}'
           if [ -z "$FILTER" ]; then
-            # All states.
             MATRIX=$(jq -c '{include: .regions}' states.json)
           else
-            # Filter to the comma-separated ids the caller passed.
             MATRIX=$(jq -c --arg ids "$FILTER" '
               ($ids | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $wanted
               | {include: [.regions[] | select(.id as $i | $wanted | index($i))]}
             ' states.json)
           fi
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-          echo "Matrix:"
-          echo "$MATRIX" | jq .
 
-  # Ensure the release exists before any uploads (action-gh-release will
-  # create it on first upload, but doing it up-front avoids race conditions
-  # between matrix jobs trying to create the same tag simultaneously).
   prepare-release:
     needs: init
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Create or update release shell
+      - name: Create or update stable release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ needs.init.outputs.release_tag }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists — reusing."
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists — reusing."
           else
-            gh release create "$TAG" \
-              --title "Tile packs $TAG" \
-              --notes "Built from latest Geofabrik extracts. See catalog.json for the list of available state packs."
+            gh release create "$RELEASE_TAG" \
+              --title "Tile packs (continuously updated)" \
+              --notes "Continuously updated stable release. Per-pack version = asset updated_at."
           fi
 
+  # ── Fetch ALPR cameras from OSM Overpass — once for the whole US ─────────
+  # The per-state matrix jobs all need the same camera snapshot. Pulling it
+  # once up front and sharing via artifact is friendlier to Overpass than 51
+  # parallel queries (and gives every state a CONSISTENT snapshot — if a
+  # contributor adds a camera mid-run, no state job sees an asymmetric view).
+  #
+  # Output artifact: `cameras-us.json`, a JSON array of
+  #   [{id: "overpass-<osm_id>", lat, lon, direction?}, ...]
+  # matching the format precompute-camera-edges.py expects.
+  fetch-cameras:
+    needs: init
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Query Overpass for all US ALPR cameras
+        run: |
+          # US bbox roughly: 24.396308,-125.0,49.384358,-66.93457
+          # (continental US + most of AK/HI captured by a more generous bbox)
+          # Per OSM convention, surveillance:type=ALPR identifies the
+          # cameras DeFlock contributes. We accept either `direction` or
+          # `camera:direction` for the lens bearing — both appear in OSM
+          # depending on contributor convention (DeFlock's mobile guide
+          # uses `direction`; the Wiki advocates `camera:direction`).
+          #
+          # `timeout:600` (10 min) lets Overpass do this in one shot without
+          # 504'ing. The response is typically 5–10 MB.
+          QUERY='[out:json][timeout:600];
+          node["man_made"="surveillance"]["surveillance:type"="ALPR"]
+            (24.0,-130.0,72.0,-64.0);
+          out body;'
+
+          # Retry with backoff if Overpass returns 503/504. The community-
+          # hosted endpoints rate-limit; usually a single retry after 30s
+          # is enough.
+          for attempt in 1 2 3 4 5; do
+            echo "Overpass attempt ${attempt}/5..."
+            HTTP_CODE=$(curl -sS \
+              --max-time 700 \
+              -o overpass-raw.json \
+              -w '%{http_code}' \
+              -X POST \
+              'https://overpass-api.de/api/interpreter' \
+              --data-urlencode "data=${QUERY}")
+            echo "  HTTP ${HTTP_CODE}"
+            if [ "$HTTP_CODE" = "200" ] && [ -s overpass-raw.json ]; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::Overpass failed after 5 attempts (last HTTP=$HTTP_CODE)"
+              exit 1
+            fi
+            sleep $((30 * attempt))
+          done
+
+          RAW_SIZE=$(stat -c%s overpass-raw.json 2>/dev/null || stat -f%z overpass-raw.json)
+          echo "Raw Overpass response: ${RAW_SIZE} bytes"
+
+      - name: Transform Overpass payload to script-expected shape
+        run: |
+          # Overpass gives us a nested {version, generator, elements: [{type, id, lat, lon, tags}, ...]}
+          # The script wants a flat [{id, lat, lon, direction?}, ...] array.
+          jq '
+            [.elements[]
+              | select(.type == "node" and .lat != null and .lon != null)
+              | {
+                  id: ("overpass-" + (.id | tostring)),
+                  lat: .lat,
+                  lon: .lon,
+                  direction: (
+                    (.tags.direction // .tags["camera:direction"]) as $d
+                    | if $d == null or $d == "" then null
+                      else ($d | tonumber? // null)
+                      end
+                  ),
+                }
+              | with_entries(select(.value != null))
+            ]
+          ' overpass-raw.json > cameras-us.json
+
+          COUNT=$(jq 'length' cameras-us.json)
+          WITH_DIR=$(jq '[.[] | select(.direction != null)] | length' cameras-us.json)
+          echo "Camera count: ${COUNT} (${WITH_DIR} with direction, $((COUNT - WITH_DIR)) without)"
+          if [ "$COUNT" -lt 100 ]; then
+            echo "::error::Suspiciously few cameras returned (${COUNT}). Overpass query may have failed silently."
+            head -c 2000 overpass-raw.json
+            exit 1
+          fi
+
+      - name: Upload cameras-us.json as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cameras-us
+          path: cameras-us.json
+          retention-days: 30
+
   build:
-    needs: [init, prepare-release]
+    needs: [init, prepare-release, fetch-cameras]
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      max-parallel: 10  # GitHub free orgs get up to 20 concurrent; 10 leaves headroom.
+      max-parallel: 10
       matrix: ${{ fromJSON(needs.init.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space (states can be 1-3 GB raw)
+      # ── Skip-if-unchanged gate ─────────────────────────────────────
+      # Compare Geofabrik's Last-Modified against the existing release
+      # asset's updated_at. If the upstream PBF is no newer than what
+      # we last built, skip everything below.
+      - name: Check if rebuild needed
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # GitHub-hosted runners have ~14 GB free by default. Big states
-          # (CA, TX) plus Docker images can push us over. Strip what we
-          # don't need before downloading the PBF.
+          FORCE='${{ github.event.inputs.force_rebuild }}'
+          PBF_URL="https://download.geofabrik.de/${{ matrix.path }}-latest.osm.pbf"
+          ASSET="ghostroute_${{ matrix.id }}_tiles.tar"
+
+          # Geofabrik's HEAD response carries a Last-Modified header
+          # in HTTP date format. Convert to epoch for comparison.
+          UPSTREAM_HEADER=$(curl -sI --max-time 30 "$PBF_URL" | grep -i '^last-modified:' | sed 's/^[Ll]ast-[Mm]odified:[[:space:]]*//' | tr -d '\r\n')
+          if [ -z "$UPSTREAM_HEADER" ]; then
+            echo "No Last-Modified header from upstream — assume rebuild needed."
+            echo "needs_rebuild=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          UPSTREAM_TS=$(date -u -d "$UPSTREAM_HEADER" +%s 2>/dev/null || echo 0)
+          echo "Upstream PBF Last-Modified: $UPSTREAM_HEADER (epoch $UPSTREAM_TS)"
+
+          if [ "$FORCE" = "true" ]; then
+            echo "force_rebuild=true was passed — rebuilding regardless of timestamps."
+            echo "needs_rebuild=true" >> "$GITHUB_OUTPUT"
+            echo "upstream_ts=$UPSTREAM_TS" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get existing asset's updatedAt from the release.
+          EXISTING_UPDATED=$(gh release view "$RELEASE_TAG" --json assets -q \
+            ".assets[] | select(.name == \"$ASSET\") | .updatedAt" 2>/dev/null || true)
+          if [ -z "$EXISTING_UPDATED" ]; then
+            echo "No existing asset for $ASSET — first build."
+            echo "needs_rebuild=true" >> "$GITHUB_OUTPUT"
+            echo "upstream_ts=$UPSTREAM_TS" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          EXISTING_TS=$(date -u -d "$EXISTING_UPDATED" +%s 2>/dev/null || echo 0)
+          echo "Existing asset $ASSET updated_at: $EXISTING_UPDATED (epoch $EXISTING_TS)"
+
+          # The Last-Modified date on Geofabrik changes whenever a new
+          # PBF is published, even if road geometry didn't change. That's
+          # fine — it bounds the staleness of our pack to the upstream
+          # publishing cadence. False positives (rebuilding when nothing
+          # actually changed) cost CPU, not correctness.
+          if [ "$UPSTREAM_TS" -gt "$EXISTING_TS" ]; then
+            echo "Upstream is newer — rebuild."
+            echo "needs_rebuild=true" >> "$GITHUB_OUTPUT"
+            echo "upstream_ts=$UPSTREAM_TS" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream is no newer than existing asset — SKIP."
+            echo "needs_rebuild=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # All steps below only run when needs_rebuild == 'true'.
+
+      - name: Free disk space
+        if: steps.check.outputs.needs_rebuild == 'true'
+        run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h /
 
       - name: Download OSM extract
+        if: steps.check.outputs.needs_rebuild == 'true'
         run: |
           URL="https://download.geofabrik.de/${{ matrix.path }}-latest.osm.pbf"
-          echo "Downloading $URL"
           curl -fL --retry 3 --retry-delay 5 -o region.osm.pbf "$URL"
           ls -lh region.osm.pbf
 
       - name: Build Valhalla tiles
+        if: steps.check.outputs.needs_rebuild == 'true'
         run: |
           mkdir -p valhalla_tiles
-          # Generate the config first (writes to stdout, redirect to file).
           docker run --rm -v "$PWD:/data" ghcr.io/valhalla/valhalla:latest \
             valhalla_build_config \
               --mjolnir-tile-dir /data/valhalla_tiles \
             > valhalla.json
-          # Then build the tiles. This is the long step.
           docker run --rm -v "$PWD:/data" ghcr.io/valhalla/valhalla:latest \
             valhalla_build_tiles -c /data/valhalla.json /data/region.osm.pbf
-          # Sanity: did anything come out?
           COUNT=$(find valhalla_tiles -name '*.gph' -type f | wc -l)
           echo "Produced $COUNT .gph tile files"
           test "$COUNT" -gt 0
 
+      # ── Camera-edge precomputation ─────────────────────────────────
+      # For every ALPR camera in this state's bbox, resolve to its set
+      # of graph edge centroids using the just-built tiles. Output is
+      # cameras-edges.json, packed into the tar alongside the tile
+      # level directories. See scripts/.../precompute-camera-edges.py
+      # for the per-camera coverage policy.
+      #
+      # Gated on needs_rebuild — sidecar is only refreshed when tile
+      # pack rebuilds. Decoupling sidecar updates from tile rebuilds
+      # is a future enhancement (separate asset); for now the staleness
+      # ceiling is the quarterly tile-rebuild cron, plus any
+      # on-push/manual triggers.
+      - name: Download cameras-us snapshot
+        if: steps.check.outputs.needs_rebuild == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: cameras-us
+          path: .
+
+      - name: Install Valhalla Python wheel
+        if: steps.check.outputs.needs_rebuild == 'true'
+        run: |
+          # Same wheel used by scripts/build-norcal-tiles.sh — ships the
+          # prebuilt Valhalla C++ binaries as a pip-installable Python
+          # extension. ~30 s install.
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet valhalla
+          python3 -c "import valhalla; print('valhalla', getattr(valhalla, '__version__', 'unknown'))"
+
+      - name: Precompute camera-to-edge map for this state
+        if: steps.check.outputs.needs_rebuild == 'true'
+        run: |
+          # Compose the bbox argument from states.json (a JSON object
+          # under .regions[].bbox keyed by id). Easier than mapping
+          # matrix.bbox through GitHub Actions context.
+          BBOX=$(jq -r --arg id "${{ matrix.id }}" '
+            .regions[] | select(.id == $id) | .bbox
+            | "\(.swLat),\(.swLon),\(.neLat),\(.neLon)"
+          ' states.json)
+          if [ -z "$BBOX" ] || [ "$BBOX" = "null,null,null,null" ]; then
+            echo "::error::No bbox in states.json for state ${{ matrix.id }}"
+            exit 1
+          fi
+          echo "bbox=$BBOX"
+
+          # The valhalla.json from the Docker build has mjolnir.tile-dir
+          # set to /data/valhalla_tiles (the Docker path). Regenerate it
+          # from the pip valhalla with a HOST path so the Python Actor
+          # can find the tiles when it runs outside Docker.
+          python3 -m valhalla valhalla_build_config \
+            --mjolnir-tile-dir "$PWD/valhalla_tiles" \
+            > valhalla-precompute.json
+
+          # Name the sidecar PER STATE so multi-state installs don't
+          # overwrite each other. Each pack's tar contributes its own
+          # cameras-edges-<stateId>.json file; the app's tile-pack
+          # extractor preserves them all because the filenames are
+          # unique.
+          SIDECAR="cameras-edges-${{ matrix.id }}.json"
+          python3 scripts/ghostroute-tiles-workflow/precompute-camera-edges.py \
+            --valhalla-config valhalla-precompute.json \
+            --cameras-input cameras-us.json \
+            --bbox "$BBOX" \
+            --state-id "${{ matrix.id }}" \
+            --output "valhalla_tiles/${SIDECAR}"
+
+          # Sanity log so we can see in the workflow run how many cameras
+          # got resolved per state.
+          CAMS=$(jq '.cameras | length' "valhalla_tiles/${SIDECAR}")
+          EDGES=$(jq '[.cameras[].edges | length] | add // 0' "valhalla_tiles/${SIDECAR}")
+          BYTES=$(stat -c%s "valhalla_tiles/${SIDECAR}" 2>/dev/null || stat -f%z "valhalla_tiles/${SIDECAR}")
+          echo "[${{ matrix.id }}] ${SIDECAR}: ${CAMS} cameras, ${EDGES} edge centroids, ${BYTES} bytes"
+
       - name: Pack tiles into tar
         id: pack
+        if: steps.check.outputs.needs_rebuild == 'true'
         run: |
           ASSET="ghostroute_${{ matrix.id }}_tiles.tar"
           cd valhalla_tiles
-          # Numeric level dirs only (skip stray files).
           shopt -s nullglob
           DIRS=([0-9] [0-9][0-9])
+          # Include cameras-edges-<stateId>.json at the root of the tar
+          # alongside the tile level directories. Per-state filename so
+          # multiple installed packs coexist without overwriting.
+          SIDECARS=(cameras-edges-*.json)
           shopt -u nullglob
-          tar cf "../$ASSET" "${DIRS[@]}"
+          tar cf "../$ASSET" "${DIRS[@]}" "${SIDECARS[@]}"
           cd ..
           SIZE=$(stat -c%s "$ASSET")
-          SHA=$(sha256sum "$ASSET" | cut -d' ' -f1)
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
           echo "size=$SIZE" >> "$GITHUB_OUTPUT"
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
-          # GitHub Release single-asset limit is 2 GB. If we exceed, fail
-          # loudly here rather than silently truncating uploads.
           if [ "$SIZE" -gt 2147483647 ]; then
-            echo "::error::Pack ${{ matrix.id }} is ${SIZE} bytes > 2 GB GitHub Release limit. Split with Geofabrik subregions or osmium."
+            echo "::error::Pack ${{ matrix.id }} is $SIZE bytes > 2 GB GitHub Release limit. Split with Geofabrik subregions or osmium."
             exit 1
           fi
           ls -lh "$ASSET"
 
-      - name: Upload pack to release
+      - name: Upload pack to release (clobber existing)
+        if: steps.check.outputs.needs_rebuild == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ needs.init.outputs.release_tag }}"
-          # --clobber so reruns replace the prior asset cleanly.
-          gh release upload "$TAG" \
+          gh release upload "$RELEASE_TAG" \
             "${{ steps.pack.outputs.asset }}" \
             --clobber
 
-      - name: Record per-pack metadata for catalog
+      - name: Summary
+        if: always()
         run: |
-          mkdir -p pack-meta
-          jq -n \
-            --arg id    "${{ matrix.id }}" \
-            --arg name  "${{ matrix.name }}" \
-            --arg asset "${{ steps.pack.outputs.asset }}" \
-            --argjson size "${{ steps.pack.outputs.size }}" \
-            --arg sha   "${{ steps.pack.outputs.sha256 }}" \
-            --argjson bbox '${{ toJSON(matrix.bbox) }}' \
-            '{id:$id, name:$name, asset:$asset, sizeBytes:$size, sha256:$sha, bbox:$bbox}' \
-            > "pack-meta/${{ matrix.id }}.json"
+          if [ "${{ steps.check.outputs.needs_rebuild }}" = "true" ]; then
+            echo "::notice title=${{ matrix.id }}::Built and uploaded"
+          else
+            echo "::notice title=${{ matrix.id }}::Skipped — already current"
+          fi
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pack-meta-${{ matrix.id }}
-          path: pack-meta/${{ matrix.id }}.json
-          retention-days: 1
-
-  # After every build has either succeeded or failed (if: always() — we
-  # still emit a catalog covering only the packs that made it).
   catalog:
     needs: [init, build]
     if: always()
@@ -209,47 +420,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
-        with:
-          path: pack-meta
-          pattern: pack-meta-*
-          merge-multiple: true
-
-      - name: Generate catalog.json
+      - name: Generate catalog.json from current release state
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ needs.init.outputs.release_tag }}"
           REPO="${{ github.repository }}"
 
-          # Read every per-pack metadata file the build jobs uploaded.
-          # Each is a single JSON object. Merge into the catalog.
-          PACKS_JSON=$(jq -s '.' pack-meta/*.json 2>/dev/null || echo '[]')
+          # Fetch all assets currently in the release with their updated_at.
+          gh release view "$RELEASE_TAG" \
+            --json assets \
+            -q '.assets' \
+            > release-assets.json
 
-          # Compose the download URL per pack — these are stable links
-          # under the release tag. The /latest/download/ alias gives us
-          # a tag-agnostic URL too, but we put the tag-specific URL in
-          # the catalog so the app's version checks are unambiguous.
+          # Join states.json (bbox + name) with the live asset list.
+          # Per-pack version = asset.updated_at (ISO 8601 string). An
+          # unchanged pack keeps its prior updated_at, so the app's
+          # version comparison naturally skips re-downloading it.
           jq -n \
-            --arg version "$TAG" \
+            --slurpfile assets release-assets.json \
+            --slurpfile states states.json \
             --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg repo "$REPO" \
-            --argjson packs "$PACKS_JSON" \
-            '{
-              version: $version,
-              generatedAt: $generated,
-              packs: ($packs | map(. + {
-                version: $version,
-                url: "https://github.com/\($repo)/releases/download/\($version)/\(.asset)"
-              }))
-            }' > catalog.json
+            --arg tag  "$RELEASE_TAG" \
+            '
+            ($assets[0]) as $rel
+            | ($states[0].regions) as $regions
+            | {
+                version: "release-\($tag)",
+                generatedAt: $generated,
+                packs: ([
+                  $regions[] | . as $r
+                  | ($rel[] | select(.name == "ghostroute_\($r.id)_tiles.tar")) as $a
+                  | select($a != null)
+                  | {
+                      id: $r.id,
+                      name: $r.name,
+                      asset: $a.name,
+                      url: "https://github.com/\($repo)/releases/download/\($tag)/\($a.name)",
+                      sizeBytes: $a.size,
+                      sha256: "",
+                      bbox: $r.bbox,
+                      version: $a.updatedAt,
+                    }
+                ])
+              }
+            ' > catalog.json
 
           echo "Generated catalog with $(jq '.packs | length' catalog.json) packs"
-          jq . catalog.json | head -50
+          jq '.packs[] | {id, version, sizeBytes}' catalog.json | head -40
 
-      - name: Upload catalog.json to release
+      - name: Upload catalog.json (clobber)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ needs.init.outputs.release_tag }}"
-          gh release upload "$TAG" catalog.json --clobber
+          gh release upload "$RELEASE_TAG" catalog.json --clobber
