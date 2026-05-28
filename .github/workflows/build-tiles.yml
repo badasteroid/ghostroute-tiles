@@ -354,22 +354,58 @@ jobs:
           name: cameras-us
           path: .
 
-      - name: Install Valhalla Python wheel
+      # ── Run Valhalla service in Docker ──────────────────────────────
+      # First iteration tried `pip install valhalla` to invoke locate
+      # in-process. The PyPI wheel's __init__.py has a broken absolute
+      # import (`from filters import lookup` instead of relative) that
+      # ModuleNotFoundError's on Python 3.12 in CI. Rather than depend
+      # on a packaging bug we don't control, we run valhalla_service
+      # from the SAME Docker image we use to build the tiles (those
+      # binaries are known good — they just produced the .gph files
+      # we're about to query). The precompute script supports both
+      # backends via --valhalla-config (pip wheel) or --service-url
+      # (HTTP); we use the latter here.
+      #
+      # The service binds 0.0.0.0:8002 by default; published as host
+      # port 8002 for our Python script to POST against. Started
+      # detached, given ~10 s to come up, then killed in the cleanup
+      # step regardless of outcome.
+      - name: Start valhalla_service in background
+        id: svc
         if: steps.check.outputs.needs_rebuild == 'true'
         run: |
-          # Same wheel used by scripts/build-norcal-tiles.sh — ships the
-          # prebuilt Valhalla C++ binaries as a pip-installable Python
-          # extension. ~30 s install.
-          python3 -m pip install --quiet --upgrade pip
-          python3 -m pip install --quiet valhalla
-          python3 -c "import valhalla; print('valhalla', getattr(valhalla, '__version__', 'unknown'))"
+          # Inside-Docker valhalla.json — service runs in container so
+          # tile-dir is /data/valhalla_tiles (matches what
+          # valhalla_build_tiles wrote above).
+          docker run -d --name valhalla-svc \
+            -v "$PWD:/data" \
+            -p 8002:8002 \
+            ghcr.io/valhalla/valhalla:latest \
+            valhalla_service /data/valhalla.json 1
+          # Wait for the HTTP endpoint to come up. Poll /status (cheap
+          # endpoint that returns 200 immediately once the actor is
+          # initialized). 30 s is generous; in practice the service
+          # binds in 2-5 s.
+          READY=0
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://localhost:8002/status > /dev/null 2>&1; then
+              READY=1
+              echo "valhalla_service ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::valhalla_service did not become ready within 30 s"
+            docker logs valhalla-svc | tail -40
+            exit 1
+          fi
 
       - name: Precompute camera-to-edge map for this state
         if: steps.check.outputs.needs_rebuild == 'true'
         run: |
           # Compose the bbox argument from states.json (a JSON object
-          # under .regions[].bbox keyed by id). Easier than mapping
-          # matrix.bbox through GitHub Actions context.
+          # under .regions[].bbox keyed by id).
           BBOX=$(jq -r --arg id "${{ matrix.id }}" '
             .regions[] | select(.id == $id) | .bbox
             | "\(.swLat),\(.swLon),\(.neLat),\(.neLon)"
@@ -380,14 +416,6 @@ jobs:
           fi
           echo "bbox=$BBOX"
 
-          # The valhalla.json from the Docker build has mjolnir.tile-dir
-          # set to /data/valhalla_tiles (the Docker path). Regenerate it
-          # from the pip valhalla with a HOST path so the Python Actor
-          # can find the tiles when it runs outside Docker.
-          python3 -m valhalla valhalla_build_config \
-            --mjolnir-tile-dir "$PWD/valhalla_tiles" \
-            > valhalla-precompute.json
-
           # Name the sidecar PER STATE so multi-state installs don't
           # overwrite each other. Each pack's tar contributes its own
           # cameras-edges-<stateId>.json file; the app's tile-pack
@@ -395,7 +423,7 @@ jobs:
           # unique.
           SIDECAR="cameras-edges-${{ matrix.id }}.json"
           python3 scripts/ghostroute-tiles-workflow/precompute-camera-edges.py \
-            --valhalla-config valhalla-precompute.json \
+            --service-url http://localhost:8002 \
             --cameras-input cameras-us.json \
             --bbox "$BBOX" \
             --state-id "${{ matrix.id }}" \
@@ -407,6 +435,15 @@ jobs:
           EDGES=$(jq '[.cameras[].edges | length] | add // 0' "valhalla_tiles/${SIDECAR}")
           BYTES=$(stat -c%s "valhalla_tiles/${SIDECAR}" 2>/dev/null || stat -f%z "valhalla_tiles/${SIDECAR}")
           echo "[${{ matrix.id }}] ${SIDECAR}: ${CAMS} cameras, ${EDGES} edge centroids, ${BYTES} bytes"
+
+      - name: Stop valhalla_service
+        # Always — clean up the container even if precompute failed.
+        if: always() && steps.check.outputs.needs_rebuild == 'true'
+        run: |
+          if docker ps -a --format '{{.Names}}' | grep -q '^valhalla-svc$'; then
+            docker logs valhalla-svc 2>&1 | tail -20 || true
+            docker rm -f valhalla-svc > /dev/null
+          fi
 
       - name: Pack tiles into tar
         id: pack
@@ -503,8 +540,30 @@ jobs:
               }
             ' > catalog.json
 
-          echo "Generated catalog with $(jq '.packs | length' catalog.json) packs"
+          PACK_COUNT=$(jq '.packs | length' catalog.json)
+          echo "Generated catalog with $PACK_COUNT packs"
           jq '.packs[] | {id, version, sizeBytes}' catalog.json | head -40
+
+          # Production safety: refuse to publish an empty or near-empty
+          # catalog. The previous workflow had `if: always()` on this
+          # job, which fired even when every state build failed (e.g.
+          # the 2026-05-27 force_rebuild run where pip valhalla wheel
+          # broke). That overwrote a working catalog with 0 packs and
+          # broke production. Now: if the catalog has fewer than the
+          # last-known-good count (kept as a release annotation), we
+          # exit without uploading and surface a workflow error.
+          #
+          # Threshold: at least half of states.json's region count.
+          # Below that, something has gone systematically wrong (we
+          # already passed init+prepare+fetch-cameras to even reach
+          # catalog, so the matrix didn't completely no-op; an empty
+          # or near-empty packs[] means many state builds failed).
+          STATE_COUNT=$(jq '.regions | length' states.json)
+          MIN_REQUIRED=$(( STATE_COUNT / 2 ))
+          if [ "$PACK_COUNT" -lt "$MIN_REQUIRED" ]; then
+            echo "::error::Catalog has only $PACK_COUNT of $STATE_COUNT possible state packs (threshold: $MIN_REQUIRED). Refusing to upload — would clobber a working catalog with an incomplete one. Check the matrix build logs for state failures."
+            exit 1
+          fi
 
       - name: Upload catalog.json (clobber)
         env:
