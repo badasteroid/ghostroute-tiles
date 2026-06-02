@@ -325,11 +325,11 @@ jobs:
         if: steps.check.outputs.needs_rebuild == 'true'
         run: |
           mkdir -p valhalla_tiles
-          docker run --rm -v "$PWD:/data" ghcr.io/valhalla/valhalla:latest \
+          docker run --rm -v "$PWD:/data" ghcr.io/valhalla/valhalla:3.6.3 \
             valhalla_build_config \
               --mjolnir-tile-dir /data/valhalla_tiles \
             > valhalla.json
-          docker run --rm -v "$PWD:/data" ghcr.io/valhalla/valhalla:latest \
+          docker run --rm -v "$PWD:/data" ghcr.io/valhalla/valhalla:3.6.3 \
             valhalla_build_tiles -c /data/valhalla.json /data/region.osm.pbf
           COUNT=$(find valhalla_tiles -name '*.gph' -type f | wc -l)
           echo "Produced $COUNT .gph tile files"
@@ -380,7 +380,7 @@ jobs:
           docker run -d --name valhalla-svc \
             -v "$PWD:/data" \
             -p 8002:8002 \
-            ghcr.io/valhalla/valhalla:latest \
+            ghcr.io/valhalla/valhalla:3.6.3 \
             valhalla_service /data/valhalla.json 1
           # Wait for the HTTP endpoint to come up. Poll /status (cheap
           # endpoint that returns 200 immediately once the actor is
