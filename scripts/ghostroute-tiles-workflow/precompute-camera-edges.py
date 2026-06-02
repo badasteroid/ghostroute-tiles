@@ -33,40 +33,66 @@ Why centroid (not snapped point or edge_id):
   - Edge_ids would be tighter but require lockstep Valhalla versions
     between CI and on-device — fragile.
 
-Per-camera coverage policy:
+Per-camera coverage policy (FOV cone — must match runtime predicate
+in src/services/routingService.ts):
   For each camera at (lat, lon, direction):
     1. /locate (verbose=true) → all candidate edges Valhalla sees within
        its search radius.
     2. From the returned edges, keep those that are:
          (a) auto-traversable (edge.access.car == true), AND
-         (b) within RADIUS_M of the snap point (locate's `distance`), AND
-         (c) one of EITHER:
-             (i) heading aligned with camera direction within
-                 ±AXIS_TOLERANCE_DEG of the camera direction OR its
-                 180° opposite (= the camera reads this edge's traffic), OR
-             (ii) within NEAREST_FALLBACK_M of the camera point regardless
-                  of heading (= the camera is close enough that we
-                  conservatively exclude this edge even without
-                  direction-axis alignment — catches wide-FOV intersection
-                  cameras and cases where OSM `direction` is wrong/missing).
+         (b) within FOV_RADIUS_M of the snap point — cheap geometric
+             reject; if the closest point on the edge is past the FOV
+             radius, no point on the edge can be inside the cone, AND
+         (c) IF the camera has a direction: SOME point on the edge's
+             shape polyline lies inside the camera's FOV cone — i.e.,
+             within FOV_RADIUS_M of the camera AND bearing from camera
+             to point within ±FOV_HALF_ANGLE_DEG of camera direction.
+             IF the camera has NO direction: keep the edge (we can't
+             apply the cone test; conservative include matches the
+             runtime, which treats direction-less cameras as
+             always-reading).
     3. Dedup by edge_id, compute the centroid of each surviving edge's
        shape, write {lat, lon} for each into the camera's `edges` list.
 
-Output format (cameras-edges.json):
+Why this changed: the earlier policy (axis-diff ≤ 70° OR within 15 m
+unconditional) over-included edges that ran parallel to the camera's
+direction but sat outside its actual cone — and similarly missed edges
+the camera does read along the cone's azimuth from beyond 15 m. The
+2026-05-28 SF FOV diagnostic showed 6 of 10 "unavoidable" cameras at
+runtime were axis-diff false positives that the cone-bearing test
+correctly excludes.
+
+Output format (cameras-edges.json), schema version "2":
   {
-    "version": "1",
+    "version": "2",
     "generatedAt": "<ISO-8601 UTC>",
     "stateId": "<id from states.json>",
     "valhallaSource": "<wheel-version OR service-url-host>",
+    "qa": {
+      "totalCameras": 1234, "resolvedCameras": 1100,
+      "camerasWithNoEdges": 134, "camerasWithNoEdgesFrac": 0.108,
+      "edgesPerCameraMean": 1.7, "camerasWithDirectionalPair": 700,
+      "batchFailures": 0
+    },
     "cameras": [
       {
         "id": "overpass-12345",          # matches the app's Waypoint.id
         "lat": 37.78,                    # original camera lat/lon
         "lon": -122.41,
         "direction": 90.0,               # original (or omitted if absent)
-        "edges": [
-          {"lat": 37.7801, "lon": -122.4099},   # edge centroid 1
-          {"lat": 37.7800, "lon": -122.4101}    # edge centroid 2 (etc)
+        "fovEdges": [
+          # ONE entry per in-cone DIRECTED edge. A 2-way road's two
+          # directed edges share centroid+shape but have OPPOSITE
+          # headings (~180° apart): that heading is how A-P2
+          # disambiguates the two identical centroids; shape+graphId are
+          # the A-P3 soft-cost fallback. (No doubling — the count already
+          # includes both directions; one-way roads contribute 1.)
+          {"centroid": {"lat": 37.7801, "lon": -122.4099},
+           "heading": 171.1, "graphId": 4016499431049,
+           "shape": "<encoded polyline6>", "lengthM": 84.2},
+          {"centroid": {"lat": 37.7801, "lon": -122.4099},
+           "heading": 351.1, "graphId": 4016398767753,
+           "shape": "<encoded polyline6>", "lengthM": 84.2}
         ]
       },
       ...
@@ -103,9 +129,29 @@ from typing import Optional
 
 
 # ── Tunable constants (mirror docstring §"Per-camera coverage policy") ──────
-RADIUS_M             = 25   # Match the rendered FOV radius on-device.
-AXIS_TOLERANCE_DEG   = 70   # Heading match for "edge aligned with camera direction"
-NEAREST_FALLBACK_M   = 15   # Catch wide-FOV / intersection / wrong-direction cameras
+# Documented Flock Falcon FOV. These MUST match the on-device truth
+# predicate in src/services/routingService.ts so the exclusion set
+# (what we tell Valhalla to avoid) and the verification set (what we
+# count as "reading the route") agree on the same geometric question.
+#
+# Replaces the older axis-diff heuristic (axis-diff ≤ 70° OR within
+# 15 m unconditional), which over-counted "reading" edges that
+# happened to have parallel headings but sat outside the camera's
+# actual cone. 2026-05-28 SF FOV diagnostic showed 6 of 10
+# "unavoidable" cameras were exactly this false-positive pattern.
+FOV_RADIUS_M         = 25
+FOV_HALF_ANGLE_DEG   = 55
+# Densification step when checking whether an edge enters the cone.
+# 1 m matches the runtime sampler and the diagnostic; catches routes
+# that clip the wedge between two coarse vertices.
+FOV_SAMPLE_STEP_M    = 1.0
+
+# Minimum cumulative length of an edge inside the FOV cone before we
+# consider the edge "read" by the camera. Mirrors the runtime threshold
+# in src/services/routingService.ts (CAMERA_FOV_MIN_DWELL_M). Filters
+# tangential touches — an edge that grazes the cone boundary for a
+# single sample isn't an effective plate read at urban speeds.
+FOV_MIN_DWELL_M      = 3.0
 
 # Batch size for the HTTP locator. Valhalla service accepts arbitrarily
 # large `locations[]` arrays, but request size and response parsing
@@ -136,12 +182,88 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def axis_angle_deg(bearing_a_deg: float, bearing_b_deg: float) -> float:
     """Angle (0..90) between two bearings considered as axes (each axis
-    defined by {bearing, bearing+180}). 0 = parallel, 90 = perpendicular."""
+    defined by {bearing, bearing+180}). 0 = parallel, 90 = perpendicular.
+    Retained for legacy logs; not used by the FOV cone predicate."""
     a = bearing_a_deg % 360
     b = bearing_b_deg % 360
     diff = abs(a - b)
     diff = min(diff, 360 - diff)        # 0..180
     return min(diff, 180 - diff)         # 0..90
+
+
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Compass bearing (0 = N, clockwise) from (lat1, lon1) → (lat2, lon2).
+    Matches the runtime bearingDeg() and the diagnostic's bearing_deg()."""
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlam = math.radians(lon2 - lon1)
+    y = math.sin(dlam) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlam)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def angular_diff_deg(a: float, b: float) -> float:
+    """Smallest difference between two bearings, 0..180."""
+    d = abs(a - b) % 360
+    return min(d, 360 - d)
+
+
+def point_in_fov(cam_lat: float, cam_lon: float, cam_dir: float,
+                 pt_lat: float, pt_lon: float,
+                 radius_m: float = FOV_RADIUS_M,
+                 half_angle_deg: float = FOV_HALF_ANGLE_DEG) -> bool:
+    """True if (pt_lat, pt_lon) lies inside the camera's directional
+    FOV wedge: within radius AND bearing-to-point within ±half_angle of
+    camera direction. Mirrors the on-device pointInCameraFov() so the
+    sidecar's exclusion decisions match the runtime read predicate."""
+    dist = haversine_m(cam_lat, cam_lon, pt_lat, pt_lon)
+    if dist > radius_m:
+        return False
+    if dist < 0.1:
+        return True
+    return angular_diff_deg(bearing_deg(cam_lat, cam_lon, pt_lat, pt_lon),
+                            cam_dir) <= half_angle_deg
+
+
+def polyline_enters_fov(polyline: list[tuple[float, float]],
+                        cam_lat: float, cam_lon: float, cam_dir: float,
+                        radius_m: float = FOV_RADIUS_M,
+                        half_angle_deg: float = FOV_HALF_ANGLE_DEG,
+                        sample_m: float = FOV_SAMPLE_STEP_M,
+                        min_dwell_m: float = FOV_MIN_DWELL_M) -> bool:
+    """True if the polyline's cumulative length inside the camera's
+    FOV cone meets the min_dwell_m threshold. Densifies each segment at
+    sample_m resolution so a polyline that clips the wedge between two
+    coarse vertices is still measured. Mirrors the runtime
+    polylineEntersCameraFov() in routingService.ts — keep them in sync.
+    """
+    if len(polyline) < 2:
+        return False
+    dwell_m = 0.0
+    for i in range(len(polyline) - 1):
+        (a_lat, a_lon) = polyline[i]
+        (b_lat, b_lon) = polyline[i + 1]
+        seg_len = haversine_m(a_lat, a_lon, b_lat, b_lon)
+        if seg_len <= 0:
+            continue
+        n_samples = max(2, int(seg_len / sample_m) + 1)
+        step_m = seg_len / n_samples
+        prev_inside = None
+        for s in range(n_samples + 1):
+            t = s / n_samples
+            lat = a_lat + (b_lat - a_lat) * t
+            lon = a_lon + (b_lon - a_lon) * t
+            inside = point_in_fov(cam_lat, cam_lon, cam_dir, lat, lon,
+                                  radius_m, half_angle_deg)
+            if s > 0:
+                if inside and prev_inside:
+                    dwell_m += step_m
+                elif inside != prev_inside:
+                    dwell_m += step_m / 2
+            if dwell_m >= min_dwell_m:
+                return True
+            prev_inside = inside
+    return False
 
 
 def decode_polyline_p6(encoded: str) -> list[tuple[float, float]]:
@@ -305,26 +427,44 @@ def _parse_locate_response(response_str: str) -> list[dict]:
 
 def filter_edges_for_camera(camera: dict, locate_entry: dict) -> list[dict]:
     """Apply the per-camera coverage policy to ONE camera's locate
-    response. Returns the list of {lat, lon} edge centroid dicts to
-    write to the sidecar; returns [] if nothing qualifies.
+    response. Returns a list of v2 fovEdge dicts
+    {centroid:{lat,lon}, heading, graphId, shape, lengthM} — one per
+    in-cone directed edge — to write to the sidecar; [] if none qualify.
+
+    Predicate (must match src/services/routingService.ts FOV cone):
+      (a) Edge is auto-traversable (car access).
+      (b) Loki snap distance ≤ FOV_RADIUS_M — cheap reject; if the
+          closest point on the edge is past the radius, no point on
+          the edge can be in the cone (the cone is bounded by radius).
+      (c) If the camera has a direction: SOME point on the edge's
+          shape polyline lies inside the camera's FOV cone (directional
+          truth — bearing-from-camera-to-point within ±half-angle of
+          camera direction). If the camera has NO direction: keep the
+          edge (we can't apply the cone test; conservative include
+          matches runtime, which treats direction-less cameras as
+          always-reading).
     """
+    cam_lat = camera.get("lat")
+    cam_lon = camera.get("lon")
     direction = camera.get("direction")
     candidate_edges = (locate_entry or {}).get("edges", [])
-    if not candidate_edges:
+    if not candidate_edges or cam_lat is None or cam_lon is None:
         return []
+
+    has_direction = (direction is not None and math.isfinite(direction))
 
     out: list[dict] = []
     seen_edge_ids: set[int] = set()
 
     for e in candidate_edges:
-        # (a) Auto-traversable
+        # (a) Auto-traversable.
         access = e.get("edge", {}).get("access", {})
         if access.get("car") is not True:
             continue
 
-        # (b) Within RADIUS_M of the snap point
+        # (b) Snap distance ≤ FOV radius (cheap geometric reject).
         edge_distance = e.get("distance")
-        if edge_distance is None or edge_distance > RADIUS_M:
+        if edge_distance is None or edge_distance > FOV_RADIUS_M:
             continue
 
         # Dedup by edge_id (each directed edge has a unique GraphId).
@@ -332,19 +472,8 @@ def filter_edges_for_camera(camera: dict, locate_entry: dict) -> list[dict]:
         if edge_id is not None and edge_id in seen_edge_ids:
             continue
 
-        # (c) Either direction-aligned OR within NEAREST_FALLBACK_M
-        keep = False
-        if direction is not None and math.isfinite(direction):
-            edge_heading = e.get("heading")
-            if edge_heading is not None and math.isfinite(edge_heading):
-                if axis_angle_deg(direction, edge_heading) <= AXIS_TOLERANCE_DEG:
-                    keep = True
-        if not keep and edge_distance <= NEAREST_FALLBACK_M:
-            keep = True
-        if not keep:
-            continue
-
-        # Extract the edge's centroid from its stored shape polyline.
+        # Decode the edge's stored shape so we can run the cone test
+        # AND emit the centroid as the exclude location.
         shape_enc = e.get("edge_info", {}).get("shape")
         if not shape_enc:
             continue
@@ -354,9 +483,35 @@ def filter_edges_for_camera(camera: dict, locate_entry: dict) -> list[dict]:
             continue
         if len(shape_coords) < 2:
             continue
-        (cen_lat, cen_lon) = polyline_centroid(shape_coords)
 
-        out.append({"lat": cen_lat, "lon": cen_lon})
+        # (c) FOV cone test: any point on the edge inside the wedge?
+        if has_direction:
+            if not polyline_enters_fov(shape_coords, cam_lat, cam_lon,
+                                       direction):
+                continue
+        # else: missing direction — conservative include (matches
+        # runtime cameraReadsRoute treating direction-less cameras as
+        # always-reading).
+
+        (cen_lat, cen_lon) = polyline_centroid(shape_coords)
+        # v2: carry the per-DIRECTED-EDGE graph truth, not just the
+        # centroid. The two directed edges of a 2-way road share this
+        # shape (hence an identical centroid) but have opposite headings;
+        # that heading is what lets the runtime (A-P2) disambiguate the
+        # two identical points, and shape/graphId are the A-P3 soft-cost
+        # fallback. See A-P1-T1.
+        length_m = sum(
+            haversine_m(shape_coords[i][0], shape_coords[i][1],
+                        shape_coords[i + 1][0], shape_coords[i + 1][1])
+            for i in range(len(shape_coords) - 1)
+        )
+        out.append({
+            "centroid": {"lat": cen_lat, "lon": cen_lon},
+            "heading": e.get("heading"),
+            "graphId": edge_id,
+            "shape": shape_enc,
+            "lengthM": round(length_m, 1),
+        })
         if edge_id is not None:
             seen_edge_ids.add(edge_id)
 
@@ -413,10 +568,16 @@ def main() -> int:
     # Empty-state shortcut: skip locator init and write empty sidecar.
     if not in_bbox:
         result = {
-            "version": "1",
+            "version": "2",
             "generatedAt": datetime.now(timezone.utc).isoformat(),
             "stateId": args.state_id,
             "valhallaSource": "skipped (empty bbox)",
+            "qa": {
+                "totalCameras": 0, "resolvedCameras": 0,
+                "camerasWithNoEdges": 0, "camerasWithNoEdgesFrac": 0,
+                "edgesPerCameraMean": 0, "camerasWithDirectionalPair": 0,
+                "batchFailures": 0,
+            },
             "cameras": [],
         }
         with open(args.output, "w") as f:
@@ -436,6 +597,7 @@ def main() -> int:
     out_cameras: list[dict] = []
     edges_total = 0
     cameras_with_no_edges = 0
+    cameras_with_directional_pair = 0
     batch_failures = 0
     progress_interval = max(1, len(in_bbox) // 20)
 
@@ -462,30 +624,58 @@ def main() -> int:
         # happen), pair what we can.
         for i, cam in enumerate(batch):
             entry = responses[i] if i < len(responses) else {}
-            edges = filter_edges_for_camera(cam, entry)
-            if not edges:
+            fov_edges = filter_edges_for_camera(cam, entry)
+            if not fov_edges:
                 cameras_with_no_edges += 1
                 continue
             out_entry: dict = {
                 "id":   cam["id"],
                 "lat":  cam["lat"],
                 "lon":  cam["lon"],
-                "edges": edges,
+                "fovEdges": fov_edges,
             }
             if cam.get("direction") is not None and math.isfinite(cam["direction"]):
                 out_entry["direction"] = cam["direction"]
             out_cameras.append(out_entry)
-            edges_total += len(edges)
+            edges_total += len(fov_edges)
+            # Directional-pair QA: a 2-way in-cone road contributes two
+            # directed edges whose headings are ~180° apart. NOT a doubling
+            # gate — the count already includes both directions (one-way = 1,
+            # two-way = 2); this just confirms the pair is captured so A-P2's
+            # heading disambiguation has both to work with. (A-P1-T1.)
+            headings = [fe["heading"] for fe in fov_edges if fe.get("heading") is not None]
+            if any(angular_diff_deg(headings[a], headings[b]) >= 150.0
+                   for a in range(len(headings)) for b in range(a + 1, len(headings))):
+                cameras_with_directional_pair += 1
 
+    resolved = len(out_cameras)
+    total_cameras = len(in_bbox)
+    no_edge_frac = (cameras_with_no_edges / total_cameras) if total_cameras else 0.0
     result = {
-        "version": "1",
+        "version": "2",
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "stateId": args.state_id,
         "valhallaSource": locator.description,
+        "qa": {
+            "totalCameras": total_cameras,
+            "resolvedCameras": resolved,
+            "camerasWithNoEdges": cameras_with_no_edges,
+            "camerasWithNoEdgesFrac": round(no_edge_frac, 4),
+            "edgesPerCameraMean": round(edges_total / resolved, 3) if resolved else 0,
+            "camerasWithDirectionalPair": cameras_with_directional_pair,
+            "batchFailures": batch_failures,
+        },
         "cameras": out_cameras,
     }
     with open(args.output, "w") as f:
         json.dump(result, f, separators=(",", ":"))
+
+    # CI gate (A-P1-T1 [EMPIRICAL-GATE]): flag a high no-edge fraction rather
+    # than silently shipping a sparse sidecar.
+    if total_cameras and no_edge_frac >= 0.05:
+        print(f"[{args.state_id}] WARNING: {no_edge_frac:.1%} of cameras had no "
+              f"resolvable edge (gate is <5%) — sidecar may under-cover.",
+              file=sys.stderr)
 
     avg_edges = (edges_total / len(out_cameras)) if out_cameras else 0
     print(f"[{args.state_id}] DONE: {len(out_cameras)} cameras resolved, "
