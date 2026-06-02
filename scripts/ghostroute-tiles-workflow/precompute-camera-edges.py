@@ -327,6 +327,15 @@ class Locator:
     def locate_batch(self, locations: list[dict]) -> list[dict]:
         raise NotImplementedError
 
+    def edge_walk_ok(self, shape: str) -> bool:
+        """True if Thor's FormPath can edge-walk this shape on the TARGET engine
+        (no error 233). Default: assume walkable; subclasses that can verify
+        override. A-14 / A-P3-T3: shapes that 233 are dropped at bake time so the
+        runtime soft-cost (linear_cost_factors) path never ships an un-walkable
+        shape — clean by construction. Engine-version-coupled: re-bake + re-walk
+        whenever the on-device Valhalla version changes."""
+        return True
+
 
 class WheelLocator(Locator):
     """In-process locator via the pip-installed `valhalla` wheel. Use
@@ -401,6 +410,32 @@ class HttpLocator(Locator):
                 f"valhalla_service /locate connection failed: {e}"
             ) from e
         return _parse_locate_response(raw)
+
+    def edge_walk_ok(self, shape: str) -> bool:
+        url = self.url.rsplit("/locate", 1)[0] + "/trace_attributes"
+        body = json.dumps({
+            "encoded_polyline": shape,
+            "costing": "auto",
+            "shape_match": "edge_walk",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+                resp.read()
+            return True  # 200 → FormPath walked the shape on this engine
+        except urllib.error.HTTPError as e:
+            try:
+                text = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                text = ""
+            # 233 / "edge walk" = FormPath failure → DROP. Other 4xx/5xx are
+            # transient → keep the shape (conservative; don't lose coverage to
+            # a flaky call).
+            return not ("233" in text or "edge walk" in text.lower())
+        except urllib.error.URLError:
+            return True
 
 
 def _parse_locate_response(response_str: str) -> list[dict]:
@@ -537,6 +572,13 @@ def main() -> int:
                         help="State id (e.g. 'california') — written into the sidecar for traceability")
     parser.add_argument("--output", required=True,
                         help="Path to write cameras-edges.json")
+    parser.add_argument("--edge-walk-filter", action="store_true",
+                        help="A-14 / A-P3-T3: FormPath edge-walk every in-cone shape on the "
+                             "target engine and DROP shapes that error 233, so the runtime "
+                             "soft-cost (linear_cost_factors) path is clean by construction. "
+                             "Adds one /trace_attributes call per UNIQUE edge (cached). The "
+                             "shapeDropRate it reports is the metric that decides whether soft "
+                             "cost ships on this engine or an engine bump is worth it.")
     args = parser.parse_args()
 
     # Exactly one locator backend required (xor).
@@ -599,6 +641,12 @@ def main() -> int:
     cameras_with_no_edges = 0
     cameras_with_directional_pair = 0
     batch_failures = 0
+    # A-14 edge-walk filter state (cache by graphId → each unique edge walked
+    # at most once on the target engine).
+    edge_walk_cache: dict = {}
+    shapes_before_filter = 0
+    shapes_dropped = 0
+    dropped_ledger: list[str] = []
     progress_interval = max(1, len(in_bbox) // 20)
 
     # Process in batches. Each batch is one locate call; on failure the
@@ -625,6 +673,25 @@ def main() -> int:
         for i, cam in enumerate(batch):
             entry = responses[i] if i < len(responses) else {}
             fov_edges = filter_edges_for_camera(cam, entry)
+            if fov_edges and args.edge_walk_filter:
+                # A-14: drop shapes that don't FormPath-walk on the target engine.
+                kept = []
+                for fe in fov_edges:
+                    shapes_before_filter += 1
+                    gid = fe.get("graphId")
+                    if gid is not None and gid in edge_walk_cache:
+                        ok = edge_walk_cache[gid]
+                    else:
+                        ok = locator.edge_walk_ok(fe["shape"])
+                        if gid is not None:
+                            edge_walk_cache[gid] = ok
+                    if ok:
+                        kept.append(fe)
+                    else:
+                        shapes_dropped += 1
+                        if len(dropped_ledger) < 50:
+                            dropped_ledger.append(fe.get("shape", "")[:28])
+                fov_edges = kept
             if not fov_edges:
                 cameras_with_no_edges += 1
                 continue
@@ -664,6 +731,10 @@ def main() -> int:
             "edgesPerCameraMean": round(edges_total / resolved, 3) if resolved else 0,
             "camerasWithDirectionalPair": cameras_with_directional_pair,
             "batchFailures": batch_failures,
+            "edgeWalkFilter": args.edge_walk_filter,
+            "shapesBeforeFilter": shapes_before_filter,
+            "shapesDropped": shapes_dropped,
+            "shapeDropRate": round(shapes_dropped / shapes_before_filter, 4) if shapes_before_filter else 0,
         },
         "cameras": out_cameras,
     }
@@ -682,6 +753,15 @@ def main() -> int:
           f"{edges_total} edges total ({avg_edges:.2f} edges/camera avg), "
           f"{cameras_with_no_edges} cameras had no resolvable edge"
           + (f", {batch_failures} batch(es) failed" if batch_failures > 0 else ""))
+    if args.edge_walk_filter:
+        rate = (shapes_dropped / shapes_before_filter) if shapes_before_filter else 0
+        print(f"[{args.state_id}] EDGE-WALK FILTER: dropped {shapes_dropped}/{shapes_before_filter} "
+              f"shapes ({rate:.2%}) that 233'd on the target engine "
+              f"({len(edge_walk_cache)} unique edges tested). "
+              + ("soft cost ships clean on this engine." if rate < 0.05
+                 else "HIGH drop — an engine bump may be worth it for coverage (correctness is fine via fallback)."))
+        for s in dropped_ledger:
+            print(f"[{args.state_id}]   dropped shape head: {s}")
     return 0
 
 
