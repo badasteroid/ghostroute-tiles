@@ -121,19 +121,40 @@ jobs:
 
       - name: Query Overpass for all US ALPR cameras
         run: |
-          # US bbox roughly: 24.396308,-125.0,49.384358,-66.93457
-          # (continental US + most of AK/HI captured by a more generous bbox)
+          # Bbox tuned to cover EVERY region in states.json.
+          #
+          # The previous bbox (24.0,-130.0,72.0,-64.0) silently excluded:
+          #   - Hawaii      (states.json: swLat 18.9, swLon -160.25)
+          #   - Puerto Rico (states.json: swLat 17.88, swLon -67.95)
+          #   - Most of Alaska (states.json: swLon -180.0 — old bbox
+          #                     started at -130, missing the
+          #                     Anchorage-and-westward chunk)
+          # Their per-state matrix jobs would have run successfully but
+          # shipped empty sidecars because no cameras would have made it
+          # through the global filter. From the operator's perspective
+          # the workflow looked green but the app would silently fall
+          # back to runtime spread for those states with no signal that
+          # something was wrong.
+          #
+          # New bounds:
+          #   swLat 17.0  — below PR's 17.88
+          #   swLon -180.0 — covers the western Aleutians
+          #   neLat 72.0   — covers Alaska's northern coast
+          #   neLon -64.0  — covers Maine + PR's eastern coast (Maine
+          #                  neLon -66.95, PR neLon -65.22)
+          #
           # Per OSM convention, surveillance:type=ALPR identifies the
           # cameras DeFlock contributes. We accept either `direction` or
           # `camera:direction` for the lens bearing — both appear in OSM
           # depending on contributor convention (DeFlock's mobile guide
           # uses `direction`; the Wiki advocates `camera:direction`).
           #
-          # `timeout:600` (10 min) lets Overpass do this in one shot without
-          # 504'ing. The response is typically 5–10 MB.
+          # `timeout:600` (10 min) lets Overpass do this in one shot
+          # without 504'ing. The response is typically 5–10 MB; the
+          # widened bbox adds only the small island states' contribution.
           QUERY='[out:json][timeout:600];
           node["man_made"="surveillance"]["surveillance:type"="ALPR"]
-            (24.0,-130.0,72.0,-64.0);
+            (17.0,-180.0,72.0,-64.0);
           out body;'
 
           # Header notes (post-mortem 2026-05-27): the first iteration of
@@ -321,6 +342,14 @@ jobs:
           curl -fL --retry 3 --retry-delay 5 -o region.osm.pbf "$URL"
           ls -lh region.osm.pbf
 
+      # ── Engine version: PINNED to 3.6.3 to MATCH the on-device engine ──
+      # The app runs Valhalla 3.6.3 (Rallista/valhalla-mobile 0.5.1). The tiles
+      # AND the v2 fovEdge `shape`s must be graph-exact for THAT engine: A-P3
+      # soft cost edge-walks those shapes on-device, and a cross-version shape
+      # (baked by :latest, walked by 3.6.3) trips FormPath error 233. On-device
+      # Step-0 measured 3.59% 233 with :latest-baked shapes (2026-06-02); the
+      # fix is to bake with the same 3.6.3 the device runs. Keep this pin in
+      # lockstep with the SPM pin until the app engine is bumped (then re-pin).
       - name: Build Valhalla tiles
         if: steps.check.outputs.needs_rebuild == 'true'
         run: |
@@ -424,6 +453,7 @@ jobs:
           SIDECAR="cameras-edges-${{ matrix.id }}.json"
           python3 scripts/ghostroute-tiles-workflow/precompute-camera-edges.py \
             --service-url http://localhost:8002 \
+            --edge-walk-filter \
             --cameras-input cameras-us.json \
             --bbox "$BBOX" \
             --state-id "${{ matrix.id }}" \
