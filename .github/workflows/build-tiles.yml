@@ -462,9 +462,12 @@ jobs:
           # Sanity log so we can see in the workflow run how many cameras
           # got resolved per state.
           CAMS=$(jq '.cameras | length' "valhalla_tiles/${SIDECAR}")
-          EDGES=$(jq '[.cameras[].edges | length] | add // 0' "valhalla_tiles/${SIDECAR}")
+          # v2 sidecars carry per-directed-edge data under `fovEdges`; v1 used
+          # `edges`. Count whichever is present so the log reflects the real edge
+          # total (the old `.edges`-only query printed 0 for every v2 sidecar).
+          EDGES=$(jq '[.cameras[] | (.fovEdges // .edges // []) | length] | add // 0' "valhalla_tiles/${SIDECAR}")
           BYTES=$(stat -c%s "valhalla_tiles/${SIDECAR}" 2>/dev/null || stat -f%z "valhalla_tiles/${SIDECAR}")
-          echo "[${{ matrix.id }}] ${SIDECAR}: ${CAMS} cameras, ${EDGES} edge centroids, ${BYTES} bytes"
+          echo "[${{ matrix.id }}] ${SIDECAR}: ${CAMS} cameras, ${EDGES} fovEdges, ${BYTES} bytes"
 
       - name: Stop valhalla_service
         # Always — clean up the container even if precompute failed.

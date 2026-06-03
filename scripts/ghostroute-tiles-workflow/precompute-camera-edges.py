@@ -586,6 +586,55 @@ def filter_edges_for_camera(camera: dict, locate_entry: dict) -> list[dict]:
         if edge_id is not None:
             seen_edge_ids.add(edge_id)
 
+    # Directional coverage fallback (diagnosed cause of "no resolvable edge":
+    # diagnose-no-edge-cameras.py found 100% of SF no-edge cameras HAD a car road
+    # within FOV_RADIUS that the cone test rejected — the camera's `direction`
+    # didn't align the wedge with its road, e.g. an offset coordinate or an
+    # approximate bearing). When the cone matched NOTHING but a car road IS in the
+    # search disc, penalizing the nearest road is strictly better than leaving the
+    # camera silently un-avoidable. Monotonic: only fires when out == [], so it can
+    # never reduce coverage; flagged `fallback` for QA/transparency (no silent change).
+    if has_direction and not out:
+        cands = []
+        for e in candidate_edges:
+            if e.get("edge", {}).get("access", {}).get("car") is not True:
+                continue
+            dist = e.get("distance")
+            shape_enc = e.get("edge_info", {}).get("shape")
+            edge_id = e.get("edge_id", {}).get("value")
+            if dist is None or not shape_enc or (edge_id is not None and edge_id in seen_edge_ids):
+                continue
+            cands.append((dist, e, shape_enc, edge_id))
+        if cands:
+            nearest = min(d for d, _e, _s, _i in cands)
+            for dist, e, shape_enc, edge_id in cands:
+                if dist > nearest + 8.0:        # keep the nearest road's directed edges only
+                    continue
+                if edge_id is not None and edge_id in seen_edge_ids:
+                    continue
+                try:
+                    shape_coords = decode_polyline_p6(shape_enc)
+                except Exception:
+                    continue
+                if len(shape_coords) < 2:
+                    continue
+                (cen_lat, cen_lon) = polyline_centroid(shape_coords)
+                length_m = sum(
+                    haversine_m(shape_coords[i][0], shape_coords[i][1],
+                                shape_coords[i + 1][0], shape_coords[i + 1][1])
+                    for i in range(len(shape_coords) - 1)
+                )
+                out.append({
+                    "centroid": {"lat": cen_lat, "lon": cen_lon},
+                    "heading": e.get("heading"),
+                    "graphId": edge_id,
+                    "shape": shape_enc,
+                    "lengthM": round(length_m, 1),
+                    "fallback": True,
+                })
+                if edge_id is not None:
+                    seen_edge_ids.add(edge_id)
+
     return out
 
 
@@ -684,6 +733,7 @@ def main() -> int:
     edges_total = 0
     cameras_with_no_edges = 0
     cameras_with_directional_pair = 0
+    cameras_via_fallback = 0
     batch_failures = 0
     # A-14 edge-walk filter state (cache by graphId → each unique edge walked
     # at most once on the target engine).
@@ -739,6 +789,8 @@ def main() -> int:
                         if len(dropped_ledger) < 50:
                             dropped_ledger.append(fe.get("shape", "")[:28])
                 fov_edges = kept
+            if fov_edges and any(fe.get("fallback") for fe in fov_edges):
+                cameras_via_fallback += 1
             if not fov_edges:
                 cameras_with_no_edges += 1
                 continue
@@ -777,6 +829,7 @@ def main() -> int:
             "camerasWithNoEdgesFrac": round(no_edge_frac, 4),
             "edgesPerCameraMean": round(edges_total / resolved, 3) if resolved else 0,
             "camerasWithDirectionalPair": cameras_with_directional_pair,
+            "camerasViaFallback": cameras_via_fallback,
             "batchFailures": batch_failures,
             "edgeWalkFilter": args.edge_walk_filter,
             "shapesBeforeFilter": shapes_before_filter,
@@ -799,6 +852,7 @@ def main() -> int:
     print(f"[{args.state_id}] DONE: {len(out_cameras)} cameras resolved, "
           f"{edges_total} edges total ({avg_edges:.2f} edges/camera avg), "
           f"{cameras_with_no_edges} cameras had no resolvable edge"
+          + (f", {cameras_via_fallback} via directional fallback" if cameras_via_fallback else "")
           + (f", {batch_failures} batch(es) failed" if batch_failures > 0 else ""))
     if args.edge_walk_filter:
         rate = (shapes_dropped / shapes_before_filter) if shapes_before_filter else 0
