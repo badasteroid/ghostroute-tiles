@@ -153,6 +153,24 @@ FOV_SAMPLE_STEP_M    = 1.0
 # single sample isn't an effective plate read at urban speeds.
 FOV_MIN_DWELL_M      = 3.0
 
+# Runtime proximity gate (src/services/routingService.ts CAMERA_PROXIMITY_M): a
+# camera within this distance of the route is a candidate reader. Direction-LESS
+# cameras (no lens axis) are counted as reading ANY road within this radius
+# (cameraReadsRoute returns true on a missing direction), so the sidecar must
+# surface every road in this disc for them — not just the nearest snapped edge.
+CAMERA_PROXIMITY_M   = 60
+
+# Search radius passed to /locate per camera. Loki returns only the NEAREST edge
+# for a bare point — at an intersection that's the side street the camera sits on,
+# not the arterial it watches across the junction. A search radius makes /locate
+# return EVERY candidate edge within it, surfacing the watched road too.
+#   - Directional: the FOV cone reaches FOV_RADIUS_M; 30 m (a little margin) covers
+#     it and the cone test then keeps only in-cone edges.
+#   - Direction-LESS: surface the whole proximity disc and keep all of it.
+# General fix; no route-specific tuning.
+LOCATE_RADIUS_DIRECTIONAL_M   = 30
+LOCATE_RADIUS_DIRECTIONLESS_M = CAMERA_PROXIMITY_M
+
 # Batch size for the HTTP locator. Valhalla service accepts arbitrarily
 # large `locations[]` arrays, but request size and response parsing
 # scale with N. 200 is a sweet spot: ~1 KB per camera in the request,
@@ -511,9 +529,13 @@ def filter_edges_for_camera(camera: dict, locate_entry: dict) -> list[dict]:
         if access.get("car") is not True:
             continue
 
-        # (b) Snap distance ≤ FOV radius (cheap geometric reject).
+        # (b) Snap distance ≤ the camera's read radius (camera-relative, since we
+        # /locate the camera point): the FOV cone radius for a directional camera
+        # (step (c) then applies the cone test), or the full proximity disc for a
+        # direction-less one (which reads ANY road within it).
         edge_distance = e.get("distance")
-        if edge_distance is None or edge_distance > FOV_RADIUS_M:
+        reach_m = FOV_RADIUS_M if has_direction else CAMERA_PROXIMITY_M
+        if edge_distance is None or edge_distance > reach_m:
             continue
 
         # Dedup by edge_id (each directed edge has a unique GraphId).
@@ -565,6 +587,14 @@ def filter_edges_for_camera(camera: dict, locate_entry: dict) -> list[dict]:
             seen_edge_ids.add(edge_id)
 
     return out
+
+
+def locate_radius_for(camera: dict) -> int:
+    """The /locate search radius for a camera: a wider disc for direction-less
+    cameras (whole proximity gate) than for directional ones (FOV cone)."""
+    d = camera.get("direction")
+    has_dir = d is not None and math.isfinite(d)
+    return LOCATE_RADIUS_DIRECTIONAL_M if has_dir else LOCATE_RADIUS_DIRECTIONLESS_M
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -671,7 +701,12 @@ def main() -> int:
         if batch_start // HTTP_BATCH_SIZE % max(1, progress_interval // HTTP_BATCH_SIZE) == 0:
             print(f"[{args.state_id}] processing cameras {batch_start + 1}..{batch_start + len(batch)} of {len(in_bbox)}…")
 
-        locations = [{"lat": c["lat"], "lon": c["lon"]} for c in batch]
+        # One /locate per camera, each with a search radius so loki returns EVERY
+        # candidate edge in the camera's read disc (not just the nearest) — this is
+        # what surfaces the watched arterial at a cross-street camera and every road
+        # around a direction-less one. filter_edges_for_camera then applies the cone
+        # test (directional) or keeps all (direction-less).
+        locations = [{"lat": c["lat"], "lon": c["lon"], "radius": locate_radius_for(c)} for c in batch]
         try:
             responses = locator.locate_batch(locations)
         except Exception as e:
@@ -681,9 +716,7 @@ def main() -> int:
             cameras_with_no_edges += len(batch)
             continue
 
-        # Defensive: locate is supposed to return one entry per input
-        # location in order. If the lengths don't match (shouldn't
-        # happen), pair what we can.
+        # Defensive: locate returns one entry per input location, in order.
         for i, cam in enumerate(batch):
             entry = responses[i] if i < len(responses) else {}
             fov_edges = filter_edges_for_camera(cam, entry)
