@@ -412,11 +412,26 @@ class HttpLocator(Locator):
         return _parse_locate_response(raw)
 
     def edge_walk_ok(self, shape: str) -> bool:
-        url = self.url.rsplit("/locate", 1)[0] + "/trace_attributes"
+        # Test the ACTUAL runtime path: a single-shape linear_cost_factors route.
+        # CRITICAL: trace_attributes(shape_match=edge_walk) uses a DIFFERENT, more
+        # lenient FormPath path and does NOT predict linear_cost_factors 233s —
+        # empirically it passed shapes that 233 in add_cost_factor_edges
+        # (use_shortcuts=true) even on the same engine. So drive the real path:
+        # add_cost_factor_edges edge-walks the shape BEFORE pathfinding and throws
+        # 233 atomically if it fails. Route the shape's own endpoints (a 442/no-path
+        # is fine — the walk happens first, regardless of routability).
+        try:
+            coords = decode_polyline_p6(shape)
+        except Exception:
+            return True
+        if len(coords) < 2:
+            return True
+        (olat, olon), (dlat, dlon) = coords[0], coords[-1]
+        url = self.url.rsplit("/locate", 1)[0] + "/route"
         body = json.dumps({
-            "encoded_polyline": shape,
+            "locations": [{"lat": olat, "lon": olon}, {"lat": dlat, "lon": dlon}],
             "costing": "auto",
-            "shape_match": "edge_walk",
+            "linear_cost_factors": [{"shape": shape, "factor": 50}],
         }).encode("utf-8")
         req = urllib.request.Request(
             url, data=body, headers={"Content-Type": "application/json"}, method="POST",
@@ -424,15 +439,14 @@ class HttpLocator(Locator):
         try:
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
                 resp.read()
-            return True  # 200 → FormPath walked the shape on this engine
+            return True  # routed → the shape walked in the cost-factor path
         except urllib.error.HTTPError as e:
             try:
                 text = e.read().decode("utf-8", errors="replace")
             except Exception:
                 text = ""
-            # 233 / "edge walk" = FormPath failure → DROP. Other 4xx/5xx are
-            # transient → keep the shape (conservative; don't lose coverage to
-            # a flaky call).
+            # 233 = FormPath edge-walk failure → DROP. Anything else (442 no-path,
+            # transient 5xx) → keep (conservative; only edge-walk failures matter).
             return not ("233" in text or "edge walk" in text.lower())
         except urllib.error.URLError:
             return True
