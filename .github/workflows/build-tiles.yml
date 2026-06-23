@@ -25,6 +25,19 @@ name: Build Valhalla Tile Packs (all US states, skip-if-unchanged)
 # catalog's per-pack `version` string. Timestamps work as well as
 # tags here.
 
+# ⚠️ SUPERSEDED — do not auto-run. The live `tiles-latest` release is now a
+# NATIONAL build-once-then-slice set (base-0/base-1 + per-state L2, catalog
+# tileSchema:2) produced by scripts/ghostroute-tiles-workflow/national/ in the
+# app repo (badasteroid/ghostroute). This per-state matrix builds full-level
+# (L0+L1+L2) INDEPENDENT packs per state and regenerates a base-less,
+# schema-less catalog — running it against the national release clobbers the
+# state assets with byte-inconsistent tiles and the catalog with a broken one,
+# re-creating the 2026-06-23 cross-state routing outage.
+#
+# Auto-triggers (push + quarterly cron) were REMOVED 2026-06-23 to prevent that
+# automatic clobber. Only manual workflow_dispatch remains, and the init job
+# now hard-aborts if it detects a national release (see "Guard" step below).
+# Re-enabling this path requires deliberately reverting to the per-state model.
 on:
   workflow_dispatch:
     inputs:
@@ -38,17 +51,6 @@ on:
         default: 'false'
         type: choice
         options: ['false', 'true']
-  push:
-    branches: [main]
-    paths:
-      - 'states.json'
-      - '.github/workflows/build-tiles.yml'
-  schedule:
-    # Quarterly rebuild — first of Jan/Apr/Jul/Oct at 06:00 UTC.
-    # Monthly was overkill: road networks barely change month-over-
-    # month, and the per-state skip check makes manual reruns cheap
-    # any time fresh OSM data lands.
-    - cron: '0 6 1 1,4,7,10 *'
 
 permissions:
   contents: write
@@ -72,6 +74,28 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
+      - name: Guard — refuse to clobber the national (build-once-then-slice) release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Defense-in-depth behind the removed auto-triggers: abort the WHOLE
+          # workflow (every other job needs: init) if the live tiles-latest release
+          # is a national build-once-then-slice set. Detection: catalog tileSchema>=2
+          # OR any pack id starting with "base-". This protects a deliberate manual
+          # dispatch too. Override only via repo variable FORCE_LEGACY_OVERRIDE=true,
+          # set when you have intentionally reverted to the per-state model.
+          if [ "${{ vars.FORCE_LEGACY_OVERRIDE }}" = "true" ]; then
+            echo "FORCE_LEGACY_OVERRIDE=true — skipping national-release guard."; exit 0
+          fi
+          CAT=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/catalog.json" 2>/dev/null || echo '{}')
+          SCHEMA=$(echo "$CAT" | jq -r '.tileSchema // 0')
+          BASEPACKS=$(echo "$CAT" | jq -r '[.packs[]? | select(.id | startswith("base-"))] | length')
+          echo "live catalog: tileSchema=$SCHEMA, base-* packs=$BASEPACKS"
+          if [ "${SCHEMA:-0}" -ge 2 ] || [ "${BASEPACKS:-0}" -gt 0 ]; then
+            echo "::error::Live ${RELEASE_TAG} is a NATIONAL build-once-then-slice release (tileSchema=$SCHEMA, base packs=$BASEPACKS). This per-state workflow would clobber it. Use scripts/ghostroute-tiles-workflow/national/ in the app repo. Aborting (set FORCE_LEGACY_OVERRIDE=true to override)."
+            exit 1
+          fi
+          echo "No national release detected — legacy per-state build may proceed."
       - name: Build matrix from states.json (filtered if caller passed states=)
         id: matrix
         run: |
