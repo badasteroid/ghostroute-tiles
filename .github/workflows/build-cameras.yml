@@ -1,0 +1,155 @@
+# F-P2-T4 — Decoupled ALPR camera freshness pipeline.
+#
+# Runs on its OWN fast schedule, INDEPENDENT of the gigabyte-scale Valhalla
+# tile bake (build-tiles.yml). ALPR cameras are crowd-added continuously, so
+# they ship as a kilobyte artifact refreshed daily (or hourly) — a camera
+# added today reaches phones tomorrow without anyone re-baking a 1.2 GB tile
+# pack. Research + rationale: docs/design/CAMERA-FRESHNESS-AND-SEARCH.md.
+#
+# Output: a `cameras-latest` GitHub Release holding one tiny
+# cameras-<state>.json per state + a cameras-catalog.json the app polls
+# (ETag/version-check, like the tile catalog). The app downloads only the
+# small files for the user's installed/nearby states. This is a STATIC
+# artifact on a CDN built for distribution — sanctioned for live app use,
+# unlike a per-user Overpass query.
+#
+# Data source: OpenStreetMap directly (man_made=surveillance +
+# surveillance:type=ALPR), under ODbL. DeFlock has no bulk API; it reads
+# from OSM, so we do too. Deletion-safe by construction: we filter a FULL
+# state PBF (never an .osc change file — osmium-tool#163).
+
+name: Build ALPR camera extracts
+
+on:
+  schedule:
+    # Daily at 08:00 UTC — a few hours after Geofabrik's ~21:00 CET refresh,
+    # so each run sees the freshest daily state extracts. Add more cron
+    # lines for sub-daily freshness; the job is cheap (one tag-filter pass
+    # per state).
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+    inputs:
+      states:
+        description: 'Comma-separated state ids to rebuild (blank = all)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write  # publish release assets
+
+jobs:
+  # Generate the full state matrix from states.json (single source of truth,
+  # shared with the tile workflow). Optional workflow_dispatch `states` input
+  # narrows it for a targeted rebuild.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gen
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          regions = json.load(open("states.json"))["regions"]
+          wanted = [s.strip() for s in os.environ.get("STATES_FILTER", "").split(",") if s.strip()]
+          rows = [{"id": r["id"], "path": r["path"]} for r in regions
+                  if not wanted or r["id"] in wanted]
+          print("matrix=" + json.dumps({"include": rows}))
+          PY
+        env:
+          STATES_FILTER: ${{ github.event.inputs.states }}
+
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install osmium (pyosmium)
+        run: pip install --quiet osmium
+
+      - name: Download latest Geofabrik state extract
+        run: |
+          # Daily-fresh per-state PBF. (For sub-daily freshness, cache this
+          # PBF across runs and `pyosmium-up-to-date region.osm.pbf` against
+          # the Geofabrik <region>-updates feed before filtering — but NEVER
+          # tag-filter the .osc diffs directly: osmium-tool#163.)
+          URL="https://download.geofabrik.de/${{ matrix.path }}-latest.osm.pbf"
+          curl -fL --retry 3 --retry-delay 5 -o region.osm.pbf "$URL"
+          ls -lh region.osm.pbf
+
+      - name: Extract ALPR cameras
+        run: |
+          python3 scripts/ghostroute-tiles-workflow/build-camera-extract.py \
+            region.osm.pbf "${{ matrix.id }}" "cameras-${{ matrix.id }}.json"
+
+      - name: Vandalism / sanity guard
+        run: |
+          # Refuse to publish a wild swing vs the currently-released file —
+          # protects against an OSM mass-delete/vandalism run nuking the
+          # layer (pattern from Zaczero/osm-countries-geojson). Allows growth
+          # freely; flags a drop > 30%.
+          NEW=$(jq '.count' "cameras-${{ matrix.id }}.json")
+          PREV_URL="https://github.com/${{ github.repository }}/releases/download/cameras-latest/cameras-${{ matrix.id }}.json"
+          if curl -fsL -o prev.json "$PREV_URL" 2>/dev/null; then
+            OLD=$(jq '.count' prev.json)
+            if [ "$OLD" -gt 0 ] && [ "$NEW" -lt $((OLD * 70 / 100)) ]; then
+              echo "::error::${{ matrix.id }} camera count $NEW < 70% of previous $OLD — refusing to publish (possible vandalism)."
+              exit 1
+            fi
+            echo "count ok: $OLD -> $NEW"
+          else
+            echo "no previous release asset; first publish ($NEW cameras)"
+          fi
+
+      - name: Publish to cameras-latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cameras-latest
+          files: cameras-${{ matrix.id }}.json
+          # Overwrite the per-state asset in place; the release is a rolling
+          # "latest" pointer, not a versioned tag.
+
+  catalog:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build cameras-catalog.json
+        run: |
+          # Assemble the small catalog the app polls: per-state generatedAt +
+          # count + asset URL. The app compares generatedAt to decide which
+          # tiny files to re-download (ETag-style version check, like the
+          # routing tile catalog).
+          python3 - <<'PY'
+          import json, os, urllib.request
+          repo = os.environ["GITHUB_REPOSITORY"]
+          base = f"https://github.com/{repo}/releases/download/cameras-latest"
+          regions = json.load(open("states.json"))["regions"]
+          entries = []
+          for r in regions:
+              sid = r["id"]
+              try:
+                  with urllib.request.urlopen(f"{base}/cameras-{sid}.json") as resp:
+                      meta = json.load(resp)
+                  entries.append({
+                      "stateId": sid,
+                      "generatedAt": meta["generatedAt"],
+                      "count": meta["count"],
+                      "url": f"{base}/cameras-{sid}.json",
+                  })
+              except Exception as e:
+                  print(f"skip {sid}: {e}")
+          json.dump({"schemaVersion": 1, "states": entries}, open("cameras-catalog.json", "w"))
+          print(f"catalog: {len(entries)} states")
+          PY
+      - name: Publish catalog
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cameras-latest
+          files: cameras-catalog.json
