@@ -111,6 +111,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: cameras-latest
+          make_latest: false  # never steal the repo "Latest" flag from tiles-latest (routing catalog lives there)
           files: cameras-${{ matrix.id }}.json
           # Overwrite the per-state asset in place; the release is a rolling
           # "latest" pointer, not a versioned tag.
@@ -152,4 +153,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: cameras-latest
+          make_latest: false  # never steal the repo "Latest" flag from tiles-latest (routing catalog lives there)
           files: cameras-catalog.json
