@@ -121,6 +121,7 @@ Locator backends:
 import argparse
 import json
 import math
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -140,11 +141,56 @@ from typing import Optional
 # actual cone. 2026-05-28 SF FOV diagnostic showed 6 of 10
 # "unavoidable" cameras were exactly this false-positive pattern.
 FOV_RADIUS_M         = 25
-FOV_HALF_ANGLE_DEG   = 55
+# Match the RUNTIME cone (src/services/routingService.ts CAMERA_FOV_HALF_ANGLE_DEG)
+# so baked edges = what the runtime scorer counts. Was 55° (110° cone) — a ~5×-too-wide
+# superset the runtime parity filter had to trim per-route; baking at 35° retires that
+# shim once packs re-bake (ROUTING_ACCURACY_SPEED_REVIEW A4). The fovParams header
+# below records this so the app can flag a stale-angle pack.
+FOV_HALF_ANGLE_DEG   = 35
 # Densification step when checking whether an edge enters the cone.
 # 1 m matches the runtime sampler and the diagnostic; catches routes
 # that clip the wedge between two coarse vertices.
 FOV_SAMPLE_STEP_M    = 1.0
+
+
+import re as _re
+
+
+def camera_direction_raw(camera):
+    """The camera's raw direction value, reading `direction` OR `dir`.
+
+    build-camera-extract.py (the SINGLE upstream producer) emits the field as
+    `dir` on the wire — the name the app parses (docs/plan §1/§2). This precompute
+    formerly read only `direction`, so feeding the extract straight in silently
+    lost EVERY camera's bearing (§2 field-mismatch defect). One helper, used at
+    every point a camera's direction is read (load-time normalization, per-camera
+    filtering, locate-radius choice, output), so the two field names can never
+    diverge again. `dir` and `direction` never legitimately disagree (only one is
+    present); if both were, `direction` wins (the pre-normalized in-memory field
+    this pipeline itself writes back)."""
+    if not isinstance(camera, dict):
+        return None
+    d = camera.get("direction")
+    return d if d is not None else camera.get("dir")
+
+
+def parse_camera_direction(raw):
+    """OSM/DeFlock `direction` -> bearing in [0,360), or None. Flock tags the lens FOV as an
+    ARC RANGE, e.g. "338-23" (faces ~north). Return the arc's CENTER bearing so the camera is
+    treated directionally instead of (wrongly) directionless. Plain numbers pass through."""
+    if isinstance(raw, (int, float)):
+        return (float(raw) % 360.0) if math.isfinite(raw) else None
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if _re.fullmatch(r"-?\d+(?:\.\d+)?", s):
+        return float(s) % 360.0
+    m = _re.fullmatch(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)", s)  # arc "A-B"
+    if m:
+        a = float(m.group(1))
+        arc = (float(m.group(2)) - a) % 360.0  # width, wrapping through 0
+        return (a + arc / 2.0) % 360.0
+    return None
 
 # Minimum cumulative length of an edge inside the FOV cone before we
 # consider the edge "read" by the camera. Mirrors the runtime threshold
@@ -152,6 +198,21 @@ FOV_SAMPLE_STEP_M    = 1.0
 # tangential touches — an edge that grazes the cone boundary for a
 # single sample isn't an effective plate read at urban speeds.
 FOV_MIN_DWELL_M      = 3.0
+
+# A4 (ROUTING_ACCURACY_SPEED_REVIEW): stamp the FOV constants this bake used into
+# the sidecar header so the app can detect a stale-angle pack (and eventually
+# retire the runtime parity-filter shim once installed packs match). NOTE: the
+# bake applies the cone (radius + half-angle) but NOT the runtime road-alignment
+# gate — that stays runtime-only, so alignToleranceDeg is recorded as the runtime
+# value the app WILL apply, not something the bake enforces. directionlessReachM
+# now equals the read radius (A1 parity).
+FOV_PARAMS = {
+    "radiusM": FOV_RADIUS_M,
+    "halfAngleDeg": FOV_HALF_ANGLE_DEG,
+    "minDwellM": FOV_MIN_DWELL_M,
+    "directionlessReachM": FOV_RADIUS_M,
+    "alignToleranceDeg": 45,  # runtime-applied (CAMERA_FOV_ALIGN_TOLERANCE_DEG); bake does not gate on it
+}
 
 # Runtime proximity gate (src/services/routingService.ts CAMERA_PROXIMITY_M): a
 # camera within this distance of the route is a candidate reader. Direction-LESS
@@ -183,6 +244,23 @@ HTTP_BATCH_SIZE      = 200
 # heavy; 200 cameras typically take <2 s in production, <8 s on a cold
 # valhalla_service. 120 s is "something has gone genuinely wrong."
 HTTP_TIMEOUT_S       = 120
+
+
+# ── I/O helpers ─────────────────────────────────────────────────────────────
+
+def write_json_atomic(path: str, payload) -> None:
+    """Write JSON to `path` atomically: dump to a sibling `.tmp` then os.replace().
+
+    §5 truncate-in-place corruption risk: a crash (or an OOM kill) mid-`json.dump`
+    directly onto the output would leave a truncated sidecar. Because the empty-bbox
+    shortcut clobbers the previous good sidecar in place, a partial write there is
+    exactly the 2026-06-16-class hazard (a corrupt/empty sidecar shipped over good
+    data). os.replace is atomic on POSIX, so a reader sees either the old file or
+    the complete new one — never a half-written one."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, separators=(",", ":"))
+    os.replace(tmp, path)
 
 
 # ── Geometry helpers ────────────────────────────────────────────────────────
@@ -354,6 +432,13 @@ class Locator:
         whenever the on-device Valhalla version changes."""
         return True
 
+    def health_check(self) -> None:
+        """Raise if the backend isn't ready to serve /locate. Default: assume
+        ready — in-process backends construct in __init__ and would have thrown
+        there. HTTP backends override this to actually probe the network service,
+        so precompute verifies its dependency BEFORE computing anything."""
+        return None
+
 
 class WheelLocator(Locator):
     """In-process locator via the pip-installed `valhalla` wheel. Use
@@ -394,6 +479,22 @@ class HttpLocator(Locator):
     def __init__(self, service_url: str):
         self.url = service_url.rstrip("/") + "/locate"
         self.description = f"http {service_url}"
+
+    def health_check(self) -> None:
+        """Probe /status before relying on the service. A running valhalla_service
+        answers /status the moment its actor is initialized; a connection error
+        here means the service is absent or not yet up. We raise so precompute
+        aborts up front with a clear cause instead of grinding every camera against
+        a dead service and emitting a misleading empty sidecar (the 2026-06-16
+        incident, which blanked ALPR data for 29 states)."""
+        status_url = self.url.rsplit("/locate", 1)[0] + "/status"
+        try:
+            with urllib.request.urlopen(status_url, timeout=HTTP_TIMEOUT_S) as resp:
+                resp.read()
+        except Exception as e:
+            raise RuntimeError(
+                f"valhalla_service at {status_url} is unreachable: {e}"
+            ) from e
 
     def locate_batch(self, locations: list[dict]) -> list[dict]:
         request = {
@@ -513,7 +614,7 @@ def filter_edges_for_camera(camera: dict, locate_entry: dict) -> list[dict]:
     """
     cam_lat = camera.get("lat")
     cam_lon = camera.get("lon")
-    direction = camera.get("direction")
+    direction = parse_camera_direction(camera_direction_raw(camera))
     candidate_edges = (locate_entry or {}).get("edges", [])
     if not candidate_edges or cam_lat is None or cam_lon is None:
         return []
@@ -534,7 +635,11 @@ def filter_edges_for_camera(camera: dict, locate_entry: dict) -> list[dict]:
         # (step (c) then applies the cone test), or the full proximity disc for a
         # direction-less one (which reads ANY road within it).
         edge_distance = e.get("distance")
-        reach_m = FOV_RADIUS_M if has_direction else CAMERA_PROXIMITY_M
+        # Directionless cameras now keep edges within the READ radius (25 m), not
+        # the 60 m proximity disc — parity with the runtime cameraReadsPath fix
+        # (ROUTING_ACCURACY_SPEED_REVIEW A1: a cam past ~25 m can't OCR a plate,
+        # and the 60 m disc over-blocked the weave alternates).
+        reach_m = FOV_RADIUS_M
         if edge_distance is None or edge_distance > reach_m:
             continue
 
@@ -641,8 +746,8 @@ def filter_edges_for_camera(camera: dict, locate_entry: dict) -> list[dict]:
 def locate_radius_for(camera: dict) -> int:
     """The /locate search radius for a camera: a wider disc for direction-less
     cameras (whole proximity gate) than for directional ones (FOV cone)."""
-    d = camera.get("direction")
-    has_dir = d is not None and math.isfinite(d)
+    d = camera_direction_raw(camera)
+    has_dir = isinstance(d, (int, float)) and math.isfinite(d)
     return LOCATE_RADIUS_DIRECTIONAL_M if has_dir else LOCATE_RADIUS_DIRECTIONLESS_M
 
 
@@ -658,7 +763,10 @@ def main() -> int:
     parser.add_argument("--service-url",
                         help="URL of a running valhalla_service (HTTP mode, e.g. http://localhost:8002)")
     parser.add_argument("--cameras-input", required=True,
-                        help="Path to a JSON array of cameras: [{id, lat, lon, direction?}, ...]")
+                        help="Path to build-camera-extract.py's output (schemaVersion 1 or 2) OR a bare "
+                             "JSON array of cameras: [{id, lat, lon, dir?|direction?, type?}, ...]. The "
+                             "extract wire field is `dir` (accepted alongside legacy `direction`); `type` "
+                             "(the enforcement tier) is passed through to the sidecar.")
     parser.add_argument("--bbox", required=True,
                         help="State bbox as 'swLat,swLon,neLat,neLon' (decimal degrees)")
     parser.add_argument("--state-id", required=True,
@@ -688,11 +796,34 @@ def main() -> int:
     sw_lat, sw_lon, ne_lat, ne_lon = bbox_parts
 
     with open(args.cameras_input) as f:
-        all_cameras = json.load(f)
-    if not isinstance(all_cameras, list):
-        print(f"--cameras-input must be a JSON array, got {type(all_cameras).__name__}",
-              file=sys.stderr)
+        cameras_doc = json.load(f)
+    # Accept EITHER build-camera-extract.py's wrapped output
+    # ({schemaVersion, ..., cameras: [...]}) — the single-producer path
+    # (docs/plan §3) — OR a bare JSON array (legacy inline feed). Unwrap the
+    # object form to the cameras array.
+    if isinstance(cameras_doc, dict) and isinstance(cameras_doc.get("cameras"), list):
+        all_cameras = cameras_doc["cameras"]
+    elif isinstance(cameras_doc, list):
+        all_cameras = cameras_doc
+    else:
+        print("--cameras-input must be build-camera-extract.py output "
+              "({cameras:[...]}) or a bare JSON array, got "
+              f"{type(cameras_doc).__name__}", file=sys.stderr)
         return 2
+    # Normalize every camera's `direction` ONCE at load (handles DeFlock arc ranges like
+    # "338-23" → center bearing). Without this, ranges fall through as non-numeric and the
+    # camera bakes DIRECTIONLESS — falsely reading all travel directions + over-blocking.
+    _arc = 0
+    for _c in all_cameras:
+        _raw = camera_direction_raw(_c)  # `dir` (extract wire field) OR `direction`
+        _parsed = parse_camera_direction(_raw)
+        if isinstance(_raw, str) and "-" in _raw and _parsed is not None:
+            _arc += 1
+        # Normalize into `direction` (the in-memory canonical this pipeline uses
+        # downstream) and drop the raw `dir` so there's ONE field from here on.
+        _c["direction"] = _parsed
+        _c.pop("dir", None)
+    print(f"[precompute] normalized directions: {_arc} arc-range cameras parsed", file=sys.stderr)
 
     in_bbox = [
         c for c in all_cameras
@@ -705,6 +836,7 @@ def main() -> int:
         result = {
             "version": "2",
             "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "fovParams": FOV_PARAMS,
             "stateId": args.state_id,
             "valhallaSource": "skipped (empty bbox)",
             "qa": {
@@ -715,8 +847,7 @@ def main() -> int:
             },
             "cameras": [],
         }
-        with open(args.output, "w") as f:
-            json.dump(result, f, separators=(",", ":"))
+        write_json_atomic(args.output, result)
         print(f"[{args.state_id}] Wrote empty sidecar to {args.output}")
         return 0
 
@@ -728,6 +859,20 @@ def main() -> int:
         # mypy: validated above that one is set
         locator = WheelLocator(args.valhalla_config)  # type: ignore[arg-type]
     print(f"[{args.state_id}] locator: {locator.description}")
+
+    # Verify the dependency BEFORE computing anything. If the Valhalla service is
+    # unreachable, abort up front (no sidecar written) rather than resolving every
+    # camera against a dead service and emitting a misleading empty artifact that
+    # the end-gate then has to reject. This is what makes precompute self-protecting
+    # regardless of how it's launched (CI's /status poll, or a local run that skips
+    # it) — the 2026-06-16 incident shipped 29 empty states precisely because this
+    # check did not exist.
+    try:
+        locator.health_check()
+    except Exception as e:
+        print(f"[{args.state_id}] FATAL: {e}. Aborting before processing; no sidecar "
+              f"written. Start a healthy valhalla_service and re-run.", file=sys.stderr)
+        return 3
 
     out_cameras: list[dict] = []
     edges_total = 0
@@ -788,6 +933,15 @@ def main() -> int:
                         shapes_dropped += 1
                         if len(dropped_ledger) < 50:
                             dropped_ledger.append(fe.get("shape", "")[:28])
+                        # KEEP the edge's centroid for HARD-exclude (the avoidance
+                        # PRIMITIVE) — only the SHAPE 233s on the 3.6.3 engine. Dropping
+                        # the whole edge discarded real on-road cameras (illinois: 22
+                        # cams sat ~6-10m from a road yet resolved to 0). The app's
+                        # soft-cost path skips shapeless edges (routingService `!fe.shape`
+                        # guard), so removing just the shape keeps the camera avoidable
+                        # via its centroid while the soft-cost path stays clean.
+                        fe.pop("shape", None)
+                        kept.append(fe)
                 fov_edges = kept
             if fov_edges and any(fe.get("fallback") for fe in fov_edges):
                 cameras_via_fallback += 1
@@ -802,6 +956,10 @@ def main() -> int:
             }
             if cam.get("direction") is not None and math.isfinite(cam["direction"]):
                 out_entry["direction"] = cam["direction"]
+            # Preserve the enforcement tier from build-camera-extract classify() (omitted for the
+            # ALPR default → the app defaults a missing `type` to 'alpr'). Enables per-tier avoidance.
+            if cam.get("type"):
+                out_entry["type"] = cam["type"]
             out_cameras.append(out_entry)
             edges_total += len(fov_edges)
             # Directional-pair QA: a 2-way in-cone road contributes two
@@ -820,6 +978,7 @@ def main() -> int:
     result = {
         "version": "2",
         "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "fovParams": FOV_PARAMS,
         "stateId": args.state_id,
         "valhallaSource": locator.description,
         "qa": {
@@ -838,8 +997,7 @@ def main() -> int:
         },
         "cameras": out_cameras,
     }
-    with open(args.output, "w") as f:
-        json.dump(result, f, separators=(",", ":"))
+    write_json_atomic(args.output, result)
 
     # CI gate (A-P1-T1 [EMPIRICAL-GATE]): flag a high no-edge fraction rather
     # than silently shipping a sparse sidecar.
@@ -863,6 +1021,24 @@ def main() -> int:
                  else "HIGH drop — an engine bump may be worth it for coverage (correctness is fine via fallback)."))
         for s in dropped_ledger:
             print(f"[{args.state_id}]   dropped shape head: {s}")
+
+    # ── FAIL-CLOSED QA GATE ────────────────────────────────────────────────
+    # The 2026-06-16 incident: the Valhalla service was unreachable while this
+    # ran, every /locate batch errored, and we wrote an EMPTY sidecar yet still
+    # exited 0 — so the build tarred it and clobbered the previously-good camera
+    # data for the state. A camera-free state returns early above (empty bbox);
+    # reaching here means we HAD cameras to resolve, so an all-failed or
+    # all-unresolved result is a build failure, not a shippable artifact. Refuse
+    # to exit clean so the build aborts BEFORE packing/uploading the sidecar.
+    if batch_failures > 0:
+        print(f"[{args.state_id}] FATAL: {batch_failures} /locate batch(es) failed to "
+              f"reach the Valhalla service — the sidecar is incomplete. Refusing to "
+              f"ship; re-run against a healthy service.", file=sys.stderr)
+        return 3
+    if total_cameras > 0 and resolved == 0:
+        print(f"[{args.state_id}] FATAL: 0 of {total_cameras} cameras resolved to any "
+              f"edge — degenerate (empty) sidecar. Refusing to ship.", file=sys.stderr)
+        return 3
     return 0
 
 

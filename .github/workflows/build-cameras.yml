@@ -13,8 +13,12 @@
 # artifact on a CDN built for distribution — sanctioned for live app use,
 # unlike a per-user Overpass query.
 #
-# Data source: OpenStreetMap directly (man_made=surveillance +
-# surveillance:type=ALPR), under ODbL. DeFlock has no bulk API; it reads
+# Data source: OpenStreetMap directly, under ODbL. build-camera-extract.py
+# (the SINGLE camera producer — same script feeds the tile-bake sidecars via
+# build-national.sh) classifies man_made=surveillance (surveillance:type
+# alpr/anpr/gunshot/camera), highway=speed_camera, AND type=enforcement
+# RELATIONS (~85% of enforcement data) into the app's typed tiers
+# (schemaVersion 2, ids `overpass-<id>`). DeFlock has no bulk API; it reads
 # from OSM, so we do too. Deletion-safe by construction: we filter a FULL
 # state PBF (never an .osc change file — osmium-tool#163).
 
@@ -51,7 +55,7 @@ jobs:
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
-          regions = json.load(open("states.json"))["regions"]
+          regions = json.load(open("scripts/ghostroute-tiles-workflow/states.json"))["regions"]
           wanted = [s.strip() for s in os.environ.get("STATES_FILTER", "").split(",") if s.strip()]
           rows = [{"id": r["id"], "path": r["path"]} for r in regions
                   if not wanted or r["id"] in wanted]
@@ -83,18 +87,20 @@ jobs:
           curl -fL --retry 3 --retry-delay 5 -o region.osm.pbf "$URL"
           ls -lh region.osm.pbf
 
-      - name: Extract ALPR cameras
+      - name: Extract threat points (ALPR + enforcement tiers)
         run: |
           python3 scripts/ghostroute-tiles-workflow/build-camera-extract.py \
             region.osm.pbf "${{ matrix.id }}" "cameras-${{ matrix.id }}.json"
 
       - name: Vandalism / sanity guard
         run: |
+          FILE="cameras-${{ matrix.id }}.json"
+          # --- COUNT GUARD ---------------------------------------------------
           # Refuse to publish a wild swing vs the currently-released file —
           # protects against an OSM mass-delete/vandalism run nuking the
           # layer (pattern from Zaczero/osm-countries-geojson). Allows growth
           # freely; flags a drop > 30%.
-          NEW=$(jq '.count' "cameras-${{ matrix.id }}.json")
+          NEW=$(jq '.count' "$FILE")
           PREV_URL="https://github.com/${{ github.repository }}/releases/download/cameras-latest/cameras-${{ matrix.id }}.json"
           if curl -fsL -o prev.json "$PREV_URL" 2>/dev/null; then
             OLD=$(jq '.count' prev.json)
@@ -106,12 +112,41 @@ jobs:
           else
             echo "no previous release asset; first publish ($NEW cameras)"
           fi
+          # --- ID-FORMAT INVARIANT GATE (docs/plan §1) -----------------------
+          # The count guard is BLIND to an id-scheme flip: a regression that
+          # emitted `node/<id>` instead of the canonical `overpass-<id>` would
+          # keep the count identical yet re-open the on-device double-count
+          # schism (the `node/` copies miss their precomputed FOV edges and are
+          # counted twice against `overpass-` sidecars). So gate the id FORMAT
+          # explicitly: every published id MUST start with 'overpass-'. jq finds
+          # any offender; a non-empty result fails the publish.
+          BAD=$(jq -r '[.cameras[].id | select(startswith("overpass-") | not)] | length' "$FILE")
+          if [ "$BAD" != "0" ]; then
+            echo "::error::${{ matrix.id }}: $BAD camera id(s) do not start with 'overpass-' — id-canon regression, refusing to publish. Sample:"
+            jq -r '[.cameras[].id | select(startswith("overpass-") | not)][0:5][]' "$FILE" | sed 's/^/::error::  /'
+            exit 1
+          fi
+          # --- SCHEMA + PER-TYPE SUMMARY -------------------------------------
+          # schemaVersion must be 2 (the current extract output); surface it and
+          # the per-tier breakdown so a wrong-schema or all-one-tier regression is
+          # visible in the log AND the job summary (self-auditing CI, §1e).
+          SCHEMA=$(jq '.schemaVersion' "$FILE")
+          [ "$SCHEMA" = "2" ] || echo "::warning::${{ matrix.id }}: schemaVersion is $SCHEMA (expected 2)"
+          # Per-type counts: 'alpr' is the omitted default, so a missing `type` == alpr.
+          # NB: the alternative MUST be parenthesized PER-element — `[.cameras[].type
+          # // "alpr"]` drops the type-less (alpr) rows because `.cameras[].type`
+          # yields an EMPTY STREAM for them and `//` on an empty stream produces
+          # nothing (jq stream-vs-null semantics), silently undercounting alpr.
+          # `[.cameras[] | (.type // "alpr")]` evaluates the default per row.
+          TYPES=$(jq -r '[.cameras[] | (.type // "alpr")] | group_by(.) | map("\(.[0])=\(length)") | join(" ")' "$FILE")
+          echo "### Cameras — ${{ matrix.id }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "schemaVersion \`$SCHEMA\` · total \`$NEW\` · by tier: \`$TYPES\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "type breakdown: $TYPES"
 
       - name: Publish to cameras-latest release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: cameras-latest
-          make_latest: false  # never steal the repo "Latest" flag from tiles-latest (routing catalog lives there)
           files: cameras-${{ matrix.id }}.json
           # Overwrite the per-state asset in place; the release is a rolling
           # "latest" pointer, not a versioned tag.
@@ -131,7 +166,7 @@ jobs:
           import json, os, urllib.request
           repo = os.environ["GITHUB_REPOSITORY"]
           base = f"https://github.com/{repo}/releases/download/cameras-latest"
-          regions = json.load(open("states.json"))["regions"]
+          regions = json.load(open("scripts/ghostroute-tiles-workflow/states.json"))["regions"]
           entries = []
           for r in regions:
               sid = r["id"]
@@ -146,12 +181,15 @@ jobs:
                   })
               except Exception as e:
                   print(f"skip {sid}: {e}")
-          json.dump({"schemaVersion": 1, "states": entries}, open("cameras-catalog.json", "w"))
+          # schemaVersion 2: aligned with the per-state cameras-<state>.json files
+          # (build-camera-extract.py now stamps schemaVersion 2 — typed tiers +
+          # canonical overpass- ids). The client's ACCEPTED_SCHEMA accepts {1,2} so
+          # a device mid-rollout is never orphaned by the bump.
+          json.dump({"schemaVersion": 2, "states": entries}, open("cameras-catalog.json", "w"))
           print(f"catalog: {len(entries)} states")
           PY
       - name: Publish catalog
         uses: softprops/action-gh-release@v2
         with:
           tag_name: cameras-latest
-          make_latest: false  # never steal the repo "Latest" flag from tiles-latest (routing catalog lives there)
           files: cameras-catalog.json
