@@ -38,12 +38,26 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # here was the last live copy of the falsified "3.6.3" claim (corrected 2026-07-02).
 IMG=ghcr.io/valhalla/valhalla:3.7.0
 OSMIUM_IMG=ghcr.io/osmcode/osmium-tool:latest   # `osmium extract` for per-state PBFs
+# PYOSMIUM tool image for the extract / POI / address stages. The valhalla image has NO pip
+# (verified 2026-07-03: `pip: not found`, `python3 -m pip: No module named pip`) — the earlier
+# per-stage `pip install --quiet osmium >/dev/null` silently failed there and every pyosmium
+# stage would have failed 52×. Build ONCE per bake, fail-closed, reused by all three stages.
+PYTOOLS_IMG=gr-bake-pytools:latest
 REPO="${TILES_REPO:-badasteroid/ghostroute-tiles}"
 TAG="${RELEASE_TAG:-tiles-latest}"
 WORK="${WORK:-$PWD/nat-build}"
 US_PBF_URL="${US_PBF_URL:-https://download.geofabrik.de/north-america/us-latest.osm.pbf}"
 PR_PBF_URL="${PR_PBF_URL:-https://download.geofabrik.de/north-america/us/puerto-rico-latest.osm.pbf}"
 BAND_MAX_BYTES="${BAND_MAX_BYTES:-1900000000}"
+# OpenAddresses regional COLLECTION zips (spec §4.5). Four US regions cover all states;
+# each is a ZIP64 of per-source CSVs us/<st>/<source>.csv + a root LICENSE.txt attribution
+# manifest. Verified 2026-07-02: us_south is 2,691,582,414 bytes and Range-served
+# (Accept-Ranges: bytes), first bytes PK. The base host redirects (302) to a CDN; curl -L
+# follows it. Override OA_BASE_URL to point at a mirror. SKIP_OA=1 => OSM-only pilot run
+# (no OA fetch/slice; address DBs bake from OSM addr:* alone, still with an OSM attribution).
+OA_BASE_URL="${OA_BASE_URL:-https://data.openaddresses.io}"
+OA_REGIONS="${OA_REGIONS:-us_south us_west us_midwest us_northeast}"
+SKIP_OA="${SKIP_OA:-0}"
 PUBLISH=1; SKIP_BUILD=0
 for a in "$@"; do
   case "$a" in
@@ -56,6 +70,19 @@ done
 mkdir -p "$WORK"/{tiles,packs,assets,state_pbf}
 # Run a valhalla-image command with the work dir at /data and the scripts at /scripts.
 dock() { docker run --rm -v "$WORK:/data" -v "$HERE:/scripts" "$IMG" "$@"; }
+
+# Build the pyosmium tools image once (see PYTOOLS_IMG note above). Fail-closed: without it
+# the camera/POI/address stages cannot run, and a silent fallback would ship packs missing
+# their sidecars/DBs.
+if ! docker image inspect "$PYTOOLS_IMG" >/dev/null 2>&1; then
+  echo "[$(date -u +%H:%M:%S)] build $PYTOOLS_IMG (python:3.12-slim + pyosmium)"
+  docker build -t "$PYTOOLS_IMG" -f - . <<'DOCKERFILE'
+FROM python:3.12-slim
+RUN pip install --no-cache-dir osmium
+DOCKERFILE
+fi
+docker run --rm "$PYTOOLS_IMG" python3 -c 'import osmium' \
+  || { echo "::error::$PYTOOLS_IMG cannot import osmium — aborting" >&2; exit 1; }
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
@@ -139,6 +166,84 @@ docker run --rm -v "$WORK/pr:/data" -v "$HERE:/scripts" "$IMG" python3 /scripts/
 cp -r "$WORK"/pr/packs/base-puerto-rico "$WORK/packs/" 2>/dev/null || true
 cp -r "$WORK"/pr/packs/puerto-rico "$WORK/packs/" 2>/dev/null || true
 
+# ── 5b. OpenAddresses fetch + per-state slice (spec §4.5) ─────────────────────
+# The residential coverage OSM lacks. Runs ONCE per bake (not per state): download the 4
+# US regional COLLECTION zips (cached in $WORK/oa-zips so reruns skip), extract each zip's
+# root LICENSE.txt (per-source attribution manifest) into $WORK/oa/LICENSE.txt, then STREAM
+# every zip's per-source CSVs and bbox-slice them into $WORK/oa/<id>.csv + <id>.sources
+# (contributing-source manifest for attribution). The §6 address step passes $WORK/oa/<id>.csv
+# to build-address-db.py when present. FAIL-CLOSED: a fetch/parse failure aborts the whole
+# run — we never silently ship OSM-only after OA was requested (SKIP_OA=1 is the explicit
+# OSM-only opt-out for pilots). Streaming (python zipfile), so the ~20 GB expanded is never
+# on disk — only the cached zips + the small per-state slices.
+if [ "$SKIP_OA" = 1 ]; then
+  log "SKIP_OA=1 → OpenAddresses stage skipped (address DBs will be OSM-only)"
+else
+  log "fetch-openaddresses: download ${OA_REGIONS} collection zips (resumable, cached)"
+  mkdir -p "$WORK/oa-zips" "$WORK/oa"
+  # Reset the merged LICENSE.txt so a rerun (cached zips) doesn't append duplicate stanzas
+  # each pass. The zips are cached and skipped, but the attribution manifest is rebuilt fresh.
+  : > "$WORK/oa/LICENSE.txt"
+  OA_ZIP_ARGS=""
+  for region in $OA_REGIONS; do
+    zip="$WORK/oa-zips/openaddr-collected-${region}.zip"
+    url="$OA_BASE_URL/openaddr-collected-${region}.zip"
+    # Resumable (-C -), follow the CDN redirect (-L), retry transient failures. If the file
+    # is already fully present a resumed transfer is a no-op (curl exits 0, "416" handled).
+    if ! curl -fL -C - --retry 5 --retry-delay 10 -H 'User-Agent: ghostroute-tiles/1.0' \
+              -o "$zip" "$url"; then
+      # curl returns 33/416 when the cached file is already complete (server can't satisfy
+      # the resume Range because there are no more bytes). Treat a present, non-empty file
+      # as success; otherwise the fetch genuinely failed → abort (fail-closed).
+      if [ -s "$zip" ]; then
+        log "  ${region}: resume reported no new bytes — using cached $(du -h "$zip" | cut -f1)"
+      else
+        echo "::error::fetch-openaddresses: failed to download $url (no cached copy). " \
+             "Set SKIP_OA=1 to build OSM-only, or fix connectivity/OA_BASE_URL." >&2
+        exit 1
+      fi
+    fi
+    [ -s "$zip" ] || { echo "::error::fetch-openaddresses: $zip is empty after download" >&2; exit 1; }
+    log "  ${region}: $(du -h "$zip" | cut -f1) cached at $zip"
+    OA_ZIP_ARGS="$OA_ZIP_ARGS $zip"
+    # Extract this region's LICENSE.txt and merge into the shared attribution manifest. Each
+    # regional zip's LICENSE.txt lists its own sources; concatenating all four gives a
+    # national source→attribution map build-address-db.py resolves per state.
+    if python3 - "$zip" "$WORK/oa/LICENSE.txt" <<'PY'
+import sys, zipfile
+zip_path, out_path = sys.argv[1], sys.argv[2]
+try:
+    with zipfile.ZipFile(zip_path) as zf:
+        with zf.open("LICENSE.txt") as f:
+            txt = f.read().decode("utf-8", "replace")
+except KeyError:
+    print(f"::warning::{zip_path} has no LICENSE.txt (attribution for its sources falls back to collection-level)")
+    sys.exit(0)
+with open(out_path, "a", encoding="utf-8") as out:
+    out.write(txt)
+    out.write("\n")
+print(f"[fetch-oa] merged LICENSE.txt from {zip_path} ({len(txt)} chars)")
+PY
+    then :; else
+      echo "::error::fetch-openaddresses: failed reading LICENSE.txt from $zip (corrupt zip?)" >&2
+      exit 1
+    fi
+  done
+  # Slice every zip into per-state CSV + .sources manifests. The slicer fails-closed on a
+  # corrupt/truncated zip; an empty per-state slice is fine (that state is OSM-only).
+  log "slice-openaddresses: bbox-slice into per-state CSVs (streaming)"
+  # shellcheck disable=SC2086
+  if ! python3 "$HERE/slice_openaddresses.py" \
+        --states "$HERE/states.json" --out "$WORK/oa" --zips $OA_ZIP_ARGS; then
+    echo "::error::slice-openaddresses FAILED — aborting (never ship OSM-only after OA was " \
+         "requested; set SKIP_OA=1 to intentionally build OSM-only)." >&2
+    exit 1
+  fi
+  # Point build-address-db.py at the shared LICENSE.txt (its default search also finds it,
+  # but set it explicitly so the per-state loop is unambiguous).
+  [ -f "$WORK/oa/LICENSE.txt" ] && export ADDR_OA_LICENSE="$WORK/oa/LICENSE.txt"
+fi
+
 # ── 6. Per-state camera sidecars + POI dbs against the NATIONAL graph ─────────
 # A single valhalla_service over the national tiles resolves every state's cameras
 # (so a camera near a state line still resolves to the coherent national edges).
@@ -173,8 +278,8 @@ while read -r id; do
     # (1) EXTRACT this state's threats from its PBF (the SAME extract that feeds the
     # fresh feed — canonical overpass- ids, typed tiers, arc-aware directions). Writes
     # the wrapped {schemaVersion:2, cameras:[...]} doc precompute now consumes directly.
-    docker run --rm -v "$WORK:/data" -v "$HERE:/scripts" "$IMG" sh -c \
-      "pip install --quiet osmium >/dev/null 2>&1; python3 /scripts/build-camera-extract.py /data/state_pbf/$id.osm.pbf $id /data/packs/$id/cameras-$id.json" \
+    docker run --rm -v "$WORK:/data" -v "$HERE:/scripts" "$PYTOOLS_IMG" \
+      python3 /scripts/build-camera-extract.py "/data/state_pbf/$id.osm.pbf" "$id" "/data/packs/$id/cameras-$id.json" \
       || { log "camera extract FAILED for $id — dropping partial sidecar (state falls back to runtime cameras)"; rm -f "$PACK/cameras-$id.json" "$PACK/cameras-edges-$id.json"; CAM_FAILS=$((CAM_FAILS+1)); }
     # (2) PRECOMPUTE FOV edges from the extract, resolved against the national graph.
     # Share the valhalla_service container's network so localhost:8002 resolves to it.
@@ -191,8 +296,8 @@ while read -r id; do
     # pack dir (the §7 tar globs never include it, but keep the dir clean).
     rm -f "$PACK/cameras-$id.json"
     # POI + address dbs from the same state PBF.
-    docker run --rm -v "$WORK:/data" -v "$HERE:/scripts" "$IMG" sh -c \
-      "pip install --quiet osmium >/dev/null 2>&1; python3 /scripts/build-poi-db.py /data/state_pbf/$id.osm.pbf /data/packs/$id/pois-$id.sqlite" \
+    docker run --rm -v "$WORK:/data" -v "$HERE:/scripts" "$PYTOOLS_IMG" \
+      python3 /scripts/build-poi-db.py "/data/state_pbf/$id.osm.pbf" "/data/packs/$id/pois-$id.sqlite" \
       || { log "POI db FAILED for $id — dropping partial db"; rm -f "$PACK/pois-$id.sqlite"; POI_FAILS=$((POI_FAILS+1)); }
     # On-device HOUSE-LEVEL address db (fix for "addresses show only the street").
     # Built from the SAME state PBF as the POI db (OSM leg). Optional 3rd arg
@@ -203,9 +308,15 @@ while read -r id; do
     # state whose tar would overflow the 2 GB cap (measured: TX tar ~1.89 GB + addr
     # ~214 MB), ships it as a SEPARATE uncompressed addr tar. Either way it lands in
     # tilesDir where addressSearchService.discover() finds it.
+    # OA slice + its attribution manifest (spec §4.5). Both live under $WORK/oa (→ /data/oa
+    # in the container). build-address-db.py resolves the sibling /data/oa/$id.sources +
+    # /data/oa/LICENSE.txt automatically; pass ADDR_OA_LICENSE explicitly for clarity.
     OA_CSV=""; [ -f "$WORK/oa/$id.csv" ] && OA_CSV="/data/oa/$id.csv"
-    docker run --rm -v "$WORK:/data" -v "$HERE:/scripts" "$IMG" sh -c \
-      "pip install --quiet osmium >/dev/null 2>&1; python3 /scripts/build-address-db.py /data/state_pbf/$id.osm.pbf /data/packs/$id/addr-$id.sqlite $OA_CSV" \
+    ADDR_OA_LICENSE_ARG=""; [ -f "$WORK/oa/LICENSE.txt" ] && ADDR_OA_LICENSE_ARG="-e ADDR_OA_LICENSE=/data/oa/LICENSE.txt"
+    # shellcheck disable=SC2086
+    # shellcheck disable=SC2086
+    docker run --rm $ADDR_OA_LICENSE_ARG -v "$WORK:/data" -v "$HERE:/scripts" "$PYTOOLS_IMG" \
+      python3 /scripts/build-address-db.py "/data/state_pbf/$id.osm.pbf" "/data/packs/$id/addr-$id.sqlite" $OA_CSV \
       || { log "address db FAILED for $id — dropping partial db (state falls back to Photon addresses)"; rm -f "$PACK/addr-$id.sqlite"; ADDR_FAILS=$((ADDR_FAILS+1)); }
   fi
 done < "$WORK/state_ids.txt"
