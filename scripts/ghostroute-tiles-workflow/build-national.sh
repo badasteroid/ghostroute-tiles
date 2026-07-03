@@ -78,7 +78,11 @@ if ! docker image inspect "$PYTOOLS_IMG" >/dev/null 2>&1; then
   echo "[$(date -u +%H:%M:%S)] build $PYTOOLS_IMG (python:3.12-slim + pyosmium)"
   docker build -t "$PYTOOLS_IMG" -f - . <<'DOCKERFILE'
 FROM python:3.12-slim
-RUN pip install --no-cache-dir osmium
+# libexpat1: pyosmium's compiled wheel links libexpat.so.1, which -slim strips (probe caught
+# ImportError at first launch, 2026-07-03). Runtime lib only; no compilers needed (manylinux wheel).
+RUN apt-get update && apt-get install -y --no-install-recommends libexpat1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip install --no-cache-dir osmium
 DOCKERFILE
 fi
 docker run --rm "$PYTOOLS_IMG" python3 -c 'import osmium' \
@@ -131,6 +135,21 @@ dock valhalla_build_config \
   --mjolnir-admin /data/tiles/admin.sqlite \
   $SPEEDS_FLAG \
   > "$WORK/valhalla.json"
+# DEVICE-PARITY service_limits (memory feedback-repro-server-device-limits): the stock config's
+# limits (max_exclude_locations 50, max_exclude_polygons_length 10000) silently 157/167-fail the
+# avoidance request shapes the DEVICE allows (2500 / 1000000) — any test run against this bake's
+# service would then diverge from device behavior. Precompute itself is unaffected (tiny per-
+# camera requests), but the service this script starts doubles as a test engine; keep it honest.
+python3 - "$WORK/valhalla.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+sl = cfg.setdefault("service_limits", {})
+sl["max_exclude_locations"] = 2500
+sl["max_exclude_polygons_length"] = 1000000
+json.dump(cfg, open(p, "w"), indent=2)
+print("[config] device-parity service_limits applied (exclude_locations 2500, polygons_length 1e6)")
+PY
 if [ "$SKIP_BUILD" = 0 ]; then
   log "valhalla_build_admins (national)"
   dock valhalla_build_admins -c /data/valhalla.json /data/us.osm.pbf
