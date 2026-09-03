@@ -1,0 +1,10 @@
+{
+  "_readme": "Explicitly RATIFIED per-state camera counts. When build-cameras.yml's >30% drop guard fires, camera-publish-guard.py publishes anyway IFF the new count is within +/-10% of the ratified count here. Ratify a REAL upstream drop by adding an entry via PR; a ratification older than 180 days warns. This breaks the deadlock where blocking a publish freezes the released baseline forever.",
+  "states": {
+    "wyoming": {
+      "count": 143,
+      "ratifiedAt": "2026-09-03",
+      "reason": "Upstream OSM removal of a bulk ALPR import; count stable 138-144 across 14 daily runs 2026-08-20..09-02; no tiles-repo change since 2026-07-03. Prior released baseline 546 was frozen by the publish-block deadlock."
+    }
+  }
+}

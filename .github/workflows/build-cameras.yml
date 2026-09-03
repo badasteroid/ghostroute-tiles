@@ -83,9 +83,27 @@ jobs:
           # PBF across runs and `pyosmium-up-to-date region.osm.pbf` against
           # the Geofabrik <region>-updates feed before filtering — but NEVER
           # tag-filter the .osc diffs directly: osmium-tool#163.)
+          #
+          # Geofabrik returns 502/503 while its ~21:00 CET refresh republishes
+          # every extract; that overload froze 11 states on 2026-08-28. curl's
+          # built-in --retry alone exhausted inside the window, so wrap it in an
+          # OUTER loop with a long sleep that outlasts a multi-minute refresh.
+          # No mirror fallback: no public mirror carries the identical
+          # <region>-latest.osm.pbf layout (GWDG/openstreetmap.fr both 404 it),
+          # and a per-state failure no longer freezes the catalog now that the
+          # catalog job runs with if: always() + a coverage floor.
           URL="https://download.geofabrik.de/${{ matrix.path }}-latest.osm.pbf"
-          curl -fL --retry 3 --retry-delay 5 -o region.osm.pbf "$URL"
-          ls -lh region.osm.pbf
+          for attempt in 1 2 3 4; do
+            if curl -fL --retry 6 --retry-delay 15 --retry-all-errors \
+                    --retry-connrefused --max-time 900 -o region.osm.pbf "$URL"; then
+              ls -lh region.osm.pbf
+              exit 0
+            fi
+            echo "::warning::${{ matrix.id }}: Geofabrik download attempt $attempt failed; sleeping before retry."
+            sleep 90
+          done
+          echo "::error::${{ matrix.id }}: Geofabrik unreachable after 4 rounds — skipping this state (its prior release asset is retained)."
+          exit 1
 
       - name: Extract threat points (ALPR + enforcement tiers)
         run: |
@@ -94,54 +112,28 @@ jobs:
 
       - name: Vandalism / sanity guard
         run: |
+          # Decision logic lives in camera-publish-guard.py (UNIT-TESTED in
+          # test_camera_publish_guard.py) — the inline jq this replaces could
+          # not be tested, and its count guard DEADLOCKED: blocking a publish
+          # freezes the released baseline, so a real upstream drop (Wyoming
+          # 546->143) could never self-heal. The script publishes a >30% drop
+          # anyway IFF the new count is within +/-10% of an explicitly RATIFIED
+          # baseline in camera-count-baselines.json. It still hard-blocks an
+          # id-scheme regression (non 'overpass-' ids) and warns on wrong schema.
           FILE="cameras-${{ matrix.id }}.json"
-          # --- COUNT GUARD ---------------------------------------------------
-          # Refuse to publish a wild swing vs the currently-released file —
-          # protects against an OSM mass-delete/vandalism run nuking the
-          # layer (pattern from Zaczero/osm-countries-geojson). Allows growth
-          # freely; flags a drop > 30%.
-          NEW=$(jq '.count' "$FILE")
           PREV_URL="https://github.com/${{ github.repository }}/releases/download/cameras-latest/cameras-${{ matrix.id }}.json"
+          PREV_ARG=""
           if curl -fsL -o prev.json "$PREV_URL" 2>/dev/null; then
-            OLD=$(jq '.count' prev.json)
-            if [ "$OLD" -gt 0 ] && [ "$NEW" -lt $((OLD * 70 / 100)) ]; then
-              echo "::error::${{ matrix.id }} camera count $NEW < 70% of previous $OLD — refusing to publish (possible vandalism)."
-              exit 1
-            fi
-            echo "count ok: $OLD -> $NEW"
+            PREV_ARG="--prev prev.json"
           else
-            echo "no previous release asset; first publish ($NEW cameras)"
+            echo "no previous release asset; first publish"
           fi
-          # --- ID-FORMAT INVARIANT GATE (docs/plan §1) -----------------------
-          # The count guard is BLIND to an id-scheme flip: a regression that
-          # emitted `node/<id>` instead of the canonical `overpass-<id>` would
-          # keep the count identical yet re-open the on-device double-count
-          # schism (the `node/` copies miss their precomputed FOV edges and are
-          # counted twice against `overpass-` sidecars). So gate the id FORMAT
-          # explicitly: every published id MUST start with 'overpass-'. jq finds
-          # any offender; a non-empty result fails the publish.
-          BAD=$(jq -r '[.cameras[].id | select(startswith("overpass-") | not)] | length' "$FILE")
-          if [ "$BAD" != "0" ]; then
-            echo "::error::${{ matrix.id }}: $BAD camera id(s) do not start with 'overpass-' — id-canon regression, refusing to publish. Sample:"
-            jq -r '[.cameras[].id | select(startswith("overpass-") | not)][0:5][]' "$FILE" | sed 's/^/::error::  /'
-            exit 1
-          fi
-          # --- SCHEMA + PER-TYPE SUMMARY -------------------------------------
-          # schemaVersion must be 2 (the current extract output); surface it and
-          # the per-tier breakdown so a wrong-schema or all-one-tier regression is
-          # visible in the log AND the job summary (self-auditing CI, §1e).
-          SCHEMA=$(jq '.schemaVersion' "$FILE")
-          [ "$SCHEMA" = "2" ] || echo "::warning::${{ matrix.id }}: schemaVersion is $SCHEMA (expected 2)"
-          # Per-type counts: 'alpr' is the omitted default, so a missing `type` == alpr.
-          # NB: the alternative MUST be parenthesized PER-element — `[.cameras[].type
-          # // "alpr"]` drops the type-less (alpr) rows because `.cameras[].type`
-          # yields an EMPTY STREAM for them and `//` on an empty stream produces
-          # nothing (jq stream-vs-null semantics), silently undercounting alpr.
-          # `[.cameras[] | (.type // "alpr")]` evaluates the default per row.
-          TYPES=$(jq -r '[.cameras[] | (.type // "alpr")] | group_by(.) | map("\(.[0])=\(length)") | join(" ")' "$FILE")
-          echo "### Cameras — ${{ matrix.id }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "schemaVersion \`$SCHEMA\` · total \`$NEW\` · by tier: \`$TYPES\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "type breakdown: $TYPES"
+          python3 scripts/ghostroute-tiles-workflow/camera-publish-guard.py \
+            "$FILE" \
+            --state "${{ matrix.id }}" \
+            $PREV_ARG \
+            --baselines scripts/ghostroute-tiles-workflow/camera-count-baselines.json \
+            --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Publish to cameras-latest release
         uses: softprops/action-gh-release@v2
@@ -150,9 +142,26 @@ jobs:
           files: cameras-${{ matrix.id }}.json
           # Overwrite the per-state asset in place; the release is a rolling
           # "latest" pointer, not a versioned tag.
+          # make_latest:false — this DAILY job must NEVER steal GitHub's "Latest"
+          # flag from tiles-latest (the 2026-06-30 hijack: /releases/latest resolved
+          # to the camera release, which has no routing catalog.json, so fresh
+          # installs 404'd and showed "Offline"). Defense-in-depth: the app also pins
+          # fixed tags (cameraCatalogService/routingTilePackService/basemapAssetService),
+          # but every release producer here MUST set this so no one holds Latest by accident.
+          make_latest: false
 
   catalog:
     needs: [setup, build]
+    # if: always() — a SINGLE failed state must NOT skip the catalog. The
+    # 2026-08-20..09-02 outage: Wyoming's guard failed the `build` job, so this
+    # job (default `needs` gating = skip-if-any-dependency-failed) never ran, and
+    # cameras-catalog.json froze at 2026-08-19 while 51/53 per-state assets
+    # published fine — the app gates every download on the catalog, so it saw
+    # NOTHING for 14 days. Run whenever setup produced a matrix; the build-side
+    # per-state failures are tolerated because each state keeps its prior release
+    # asset, and the coverage floor below refuses to publish a catalog that lost
+    # too many states at once (a real mass outage, not one flaky state).
+    if: always() && needs.setup.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -162,12 +171,20 @@ jobs:
           # count + asset URL. The app compares generatedAt to decide which
           # tiny files to re-download (ETag-style version check, like the
           # routing tile catalog).
+          #
+          # COVERAGE FLOOR: refuse to publish a catalog covering < 90% of the
+          # states in states.json. A per-state asset that transiently failed to
+          # (re)publish still resolves here from its PRIOR release asset, so a
+          # low coverage number means a real mass outage (many assets missing
+          # entirely) — publishing that catalog would strand the missing states'
+          # devices. Below the floor we fail LOUDLY and keep the last-good
+          # catalog rather than shrink the served set.
           python3 - <<'PY'
-          import json, os, urllib.request
+          import json, os, sys, urllib.request
           repo = os.environ["GITHUB_REPOSITORY"]
           base = f"https://github.com/{repo}/releases/download/cameras-latest"
           regions = json.load(open("scripts/ghostroute-tiles-workflow/states.json"))["regions"]
-          entries = []
+          entries, missing = [], []
           for r in regions:
               sid = r["id"]
               try:
@@ -180,16 +197,27 @@ jobs:
                       "url": f"{base}/cameras-{sid}.json",
                   })
               except Exception as e:
+                  missing.append(sid)
                   print(f"skip {sid}: {e}")
+          total = len(regions)
+          coverage = len(entries) / total if total else 0
+          print(f"catalog: {len(entries)}/{total} states ({coverage:.1%}); missing: {missing}")
+          FLOOR = 0.90
+          if coverage < FLOOR:
+              print(f"::error::catalog coverage {coverage:.1%} < {FLOOR:.0%} "
+                    f"({len(missing)} states missing) — refusing to publish a shrunken catalog; "
+                    f"keeping the last-good one. Missing: {missing}")
+              sys.exit(1)
           # schemaVersion 2: aligned with the per-state cameras-<state>.json files
           # (build-camera-extract.py now stamps schemaVersion 2 — typed tiers +
           # canonical overpass- ids). The client's ACCEPTED_SCHEMA accepts {1,2} so
           # a device mid-rollout is never orphaned by the bump.
           json.dump({"schemaVersion": 2, "states": entries}, open("cameras-catalog.json", "w"))
-          print(f"catalog: {len(entries)} states")
+          print(f"catalog written: {len(entries)} states")
           PY
       - name: Publish catalog
         uses: softprops/action-gh-release@v2
         with:
           tag_name: cameras-latest
           files: cameras-catalog.json
+          make_latest: false  # never steal "Latest" from tiles-latest (see the release step above)
