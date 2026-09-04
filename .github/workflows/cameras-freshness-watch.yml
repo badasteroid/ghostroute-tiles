@@ -1,0 +1,77 @@
+# Camera freshness WATCHDOG — the alarm that did not exist during the
+# 2026-08-20..09-02 outage, when camera data froze for 14 days in total silence.
+#
+# Why a separate workflow from build-cameras.yml: a watchdog that lives inside
+# the thing it watches cannot report that thing failing to run at all. This runs
+# on its own schedule and checks the OUTCOME (is the served catalog fresh?), so
+# it catches causes nobody predicted — not just the two bugs fixed 2026-09-03.
+#
+# Decision logic: scripts/ghostroute-tiles-workflow/camera-freshness-check.py
+# (unit-tested in test_camera_freshness_check.py).
+name: Camera freshness watchdog
+
+on:
+  schedule:
+    # Every 6h — the daily build runs at 08:00 UTC, so a freeze is caught within
+    # hours instead of the 14 days it took last time.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write # open/update the staleness alarm issue
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check served catalog freshness
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          R="${{ github.repository }}"
+          UPDATED=$(gh api "repos/$R/releases/tags/cameras-latest" \
+            --jq '.assets[]|select(.name=="cameras-catalog.json")|.updated_at' 2>/dev/null || true)
+          curl -fsL "https://github.com/$R/releases/download/cameras-latest/cameras-catalog.json" \
+            -o catalog.json || echo '{"states":[]}' > catalog.json
+          set +e
+          python3 scripts/ghostroute-tiles-workflow/camera-freshness-check.py \
+            --catalog-updated-at "$UPDATED" \
+            --catalog-file catalog.json \
+            --summary "$GITHUB_STEP_SUMMARY" | tee check-output.txt
+          echo "stale=$?" >> "$GITHUB_OUTPUT"
+          set -e
+          # Keep the message for the issue body.
+          { echo 'body<<EOF'; cat check-output.txt; echo EOF; } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the staleness alarm issue
+        if: steps.check.outputs.stale != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          R="${{ github.repository }}"
+          TITLE="Camera data is STALE — devices are not receiving updates"
+          RUN_URL="https://github.com/$R/actions/runs/${{ github.run_id }}"
+          BODY=$(printf '%s\n\n%s\n\n%s\n' \
+            "${{ steps.check.outputs.body }}" \
+            "Watchdog run: $RUN_URL" \
+            "Runbook: scripts/ghostroute-tiles-workflow/CAMERA-PIPELINE-HEALTH.md")
+          EXISTING=$(gh issue list -R "$R" --state open --search "$TITLE in:title" \
+            --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" -R "$R" --body "$BODY"
+            echo "updated issue #$EXISTING"
+          else
+            gh issue create -R "$R" --title "$TITLE" --body "$BODY" --label "" || \
+              gh issue create -R "$R" --title "$TITLE" --body "$BODY"
+          fi
+
+      - name: Fail the run when stale
+        if: steps.check.outputs.stale != '0'
+        run: |
+          echo "::error::Camera catalog is stale — see the alarm issue."
+          exit 1
