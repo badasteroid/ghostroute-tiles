@@ -25,7 +25,7 @@ import datetime
 import json
 import sys
 
-DEFAULT_THRESHOLD_HOURS = 26  # daily job + margin for a slow run
+DEFAULT_THRESHOLD_HOURS = 30  # daily job + margin for GitHub schedule drift (observed 3-12 h)
 STUCK_STATE_MULTIPLIER = 2
 
 

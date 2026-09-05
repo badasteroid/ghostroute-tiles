@@ -26,11 +26,14 @@ name: Build ALPR camera extracts
 
 on:
   schedule:
-    # Daily at 08:00 UTC — a few hours after Geofabrik's ~21:00 CET refresh,
-    # so each run sees the freshest daily state extracts. Add more cron
-    # lines for sub-daily freshness; the job is cheap (one tag-filter pass
-    # per state).
-    - cron: '0 8 * * *'
+    # Daily at 03:23 UTC — after Geofabrik's ~21:00 CET refresh, so each run
+    # sees the freshest daily state extracts. ODD MINUTE, OFF-PEAK ON PURPOSE:
+    # GitHub delays scheduled runs under load, worst at :00 and popular hours.
+    # The old '0 8 * * *' actually fired at 11:26, 12:19, 12:50, 15:35, 19:42,
+    # 18:27 (3-12 h late) — enough to trip the freshness watchdog on a healthy
+    # day. The job is cheap (one tag-filter pass per state); add cron lines for
+    # sub-daily freshness.
+    - cron: '23 3 * * *'
   workflow_dispatch:
     inputs:
       states:
