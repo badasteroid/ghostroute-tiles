@@ -111,3 +111,15 @@ freeze the layer permanently.
   here 2026-07-17. The authoritative CI copy in the tiles repo needs the same change synced. "Latest"
   is currently held by `basemap-latest` (harmless only because the app pins tags — but the basemap
   producer should also set `make_latest: false`).
+
+## Runbook addendum 2026-09-07 — a `cron` change may NOT take effect until the workflow is cycled
+
+`2d0ab43` moved the daily build from `0 8 * * *` to `23 3 * * *` (off-peak odd minute, to cut the observed
+3–12 h schedule drift). The live file changed on 2026-09-05, but GitHub kept firing the OLD slot (09-06 08:00,
+09-07 08:30) and never fired at 03:23 — it had not re-registered the schedule. Remedy applied 2026-09-07:
+`gh workflow disable build-cameras.yml -R <repo> && gh workflow enable build-cameras.yml -R <repo>` (state
+confirmed `active` immediately after; `workflow_dispatch` unaffected). **Invariant 8: after ANY `cron` edit,
+confirm a run appears at the new slot within 24 h; if not, cycle the workflow.** Verify:
+`gh run list -R <repo> --workflow=build-cameras.yml -L 3 --json createdAt,event` — expect a `schedule` run at
+~03:23 UTC (+ modest drift). Until that appears, the watchdog's 30 h threshold is sized for the 03:23 slot and the
+old 08:00 slot + 12 h drift could reach ~36 h — the in-flight suppression is what prevents a false page then.
