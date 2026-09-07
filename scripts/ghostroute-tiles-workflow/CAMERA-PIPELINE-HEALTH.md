@@ -15,7 +15,7 @@ and basemaps (`basemap-latest`) are SEPARATE producers on their own cadences. Re
 
 ## INVARIANTS — do not break these
 
-1. **The daily job stays ENABLED.** `build-cameras.yml` runs on `cron: '0 8 * * *'`. If the workflow
+1. **The daily job stays ENABLED.** `build-cameras.yml` runs on `cron: '23 3 * * *'` (off-peak odd minute since `2d0ab43`, 2026-09-05 — the old `0 8` slot drifted 3–12 h). If the workflow
    is disabled (or GitHub auto-disables the schedule after 60 days of repo inactivity), cameras FREEZE
    — the layer silently goes stale even though the app is healthy. Scheduled workflows only run on the
    default branch.
@@ -89,8 +89,8 @@ happened with the workflow **enabled and green-ish** (per-state jobs succeeded).
 
 **INVARIANT 6 — a watchdog must check the OUTCOME, not the job.** `cameras-freshness-watch.yml`
 (cron every 6 h, decision in `camera-freshness-check.py`, 7/7 unit tests) fails loudly and
-opens/updates a GitHub issue when the **served** `cameras-catalog.json` is >26 h old, and warns when
-an individual state's `generatedAt` has not moved in >52 h (the Wyoming shape). It is a SEPARATE
+opens/updates a GitHub issue when the **served** `cameras-catalog.json` is >30 h old (26 → 30 on 2026-09-05 to absorb schedule drift; and never while a `build-cameras` run is queued/in progress), and warns when
+an individual state's `generatedAt` has not moved in >60 h (2× threshold — the Wyoming shape). It is a SEPARATE
 workflow on purpose: a watchdog inside the thing it watches cannot report that thing failing to run
 at all. Verified by dispatch: run `33829144617` SUCCESS.
 
