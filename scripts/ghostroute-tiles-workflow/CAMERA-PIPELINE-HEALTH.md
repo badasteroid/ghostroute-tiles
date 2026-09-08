@@ -112,14 +112,29 @@ freeze the layer permanently.
   is currently held by `basemap-latest` (harmless only because the app pins tags — but the basemap
   producer should also set `make_latest: false`).
 
-## Runbook addendum 2026-09-07 — a `cron` change may NOT take effect until the workflow is cycled
+## Runbook addendum 2026-09-07/08 — a `cron` change may not take effect, and cycling did NOT fix it
 
 `2d0ab43` moved the daily build from `0 8 * * *` to `23 3 * * *` (off-peak odd minute, to cut the observed
-3–12 h schedule drift). The live file changed on 2026-09-05, but GitHub kept firing the OLD slot (09-06 08:00,
-09-07 08:30) and never fired at 03:23 — it had not re-registered the schedule. Remedy applied 2026-09-07:
-`gh workflow disable build-cameras.yml -R <repo> && gh workflow enable build-cameras.yml -R <repo>` (state
-confirmed `active` immediately after; `workflow_dispatch` unaffected). **Invariant 8: after ANY `cron` edit,
-confirm a run appears at the new slot within 24 h; if not, cycle the workflow.** Verify:
-`gh run list -R <repo> --workflow=build-cameras.yml -L 3 --json createdAt,event` — expect a `schedule` run at
-~03:23 UTC (+ modest drift). Until that appears, the watchdog's 30 h threshold is sized for the 03:23 slot and the
-old 08:00 slot + 12 h drift could reach ~36 h — the in-flight suppression is what prevents a false page then.
+3-12 h schedule drift). The live file on the default branch has carried `23 3 * * *` since 2026-09-05
+(single `cron:` entry, default branch `main` - both verified via the contents API).
+
+**On 2026-09-07 I cycled the workflow (`gh workflow disable` then `enable`, state `active`) and recorded
+here that this was the remedy. That claim was NOT verified and the evidence since does not support it.**
+Scheduled fire times, UTC: 08:00 (09-06), 08:30 (09-07), 08:12 (09-08). Over the 15 scheduled runs on
+record the minimum fire time is 08:00 and **no run has ever fired before 08:00** - neither before nor
+after the cycle.
+
+The evidence is genuinely AMBIGUOUS and I am not going to guess: 08:12 is equally consistent with the OLD
+`0 8` slot at +0.2 h drift and with the NEW `23 3` slot at +4.8 h drift (this repo has shown 0-11.7 h
+drift). Two samples cannot separate them.
+
+**DECISIVE TEST — a single run that fires before 08:00 UTC proves the new schedule is live; if the minimum
+stays >= 08:00 over ~5 more days, the schedule did not re-register and the cycle is not the remedy.**
+Check with:
+`gh run list -R <repo> --workflow=build-cameras.yml -L 20 --json createdAt,event --jq '.[]|select(.event=="schedule")|.createdAt' | cut -c12-16 | sort | head -1`
+
+**This is cosmetic, not a correctness risk.** Freshness does not depend on the slot: every run since
+2026-09-04 succeeded, the watchdog is green on every tick with no issue opened, and its 30 h threshold plus
+in-flight suppression already absorbs the full observed drift range from either slot. **Invariant 8 stands
+as "after a `cron` edit, CONFIRM a run at the new slot" - but cycling the workflow is NOT a proven remedy,
+and the runbook must not claim it is.**
