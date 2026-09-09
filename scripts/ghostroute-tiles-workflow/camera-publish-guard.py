@@ -53,6 +53,11 @@ def _days_between(a_iso, b_iso):
     return abs((b - a).days)
 
 
+def _signed_days(from_iso, to_iso):
+    """to - from, in days. Negative when from_iso is in the future relative to to_iso."""
+    return (datetime.date.fromisoformat(to_iso) - datetime.date.fromisoformat(from_iso)).days
+
+
 def evaluate_publish(new_obj, prev_count, baselines, state, today):
     """Pure guard decision.
 
@@ -73,6 +78,16 @@ def evaluate_publish(new_obj, prev_count, baselines, state, today):
             f"{state}: {len(bad)} camera id(s) do not start with '{CANONICAL_ID_PREFIX}' — "
             f"id-canon regression, refusing to publish. Sample: {sample}")
 
+    # 1b. count sanity — the guard must validate its OWN headline number. `count` is what the
+    # >30% drop check compares, so a file whose scalar count disagrees with the actual cameras
+    # array (e.g. a stale count:546 on an emptied cameras:[]) would slip a real wipe past the guard.
+    cams = new_obj.get("cameras", [])
+    declared = new_obj.get("count")
+    if declared is not None and declared != len(cams):
+        r.errors.append(
+            f"{state}: declared count {declared} does not match len(cameras) {len(cams)} — "
+            f"refusing to publish a file whose own headline number is inconsistent.")
+
     # 2. schema gate (warning only).
     schema = new_obj.get("schemaVersion")
     if schema != EXPECTED_SCHEMA:
@@ -90,10 +105,16 @@ def evaluate_publish(new_obj, prev_count, baselines, state, today):
                     f"{state}: count {new_count} within +/-{int(RATIFIED_TOLERANCE * 100)}% of "
                     f"ratified baseline {bc} ({base.get('reason', 'no reason given')}) — publishing.")
                 ratified_at = base.get("ratifiedAt")
-                if ratified_at and _days_between(ratified_at, today) > RATIFICATION_MAX_AGE_DAYS:
-                    r.warnings.append(
-                        f"{state}: ratified baseline is >{RATIFICATION_MAX_AGE_DAYS} days old "
-                        f"(ratifiedAt {ratified_at}) — re-verify it still reflects reality.")
+                if ratified_at:
+                    signed = _signed_days(ratified_at, today)  # today - ratifiedAt; negative = future
+                    if signed < 0:
+                        r.warnings.append(
+                            f"{state}: ratified baseline is in the FUTURE (ratifiedAt {ratified_at}) — "
+                            f"likely a typo; the age check cannot judge it.")
+                    elif signed > RATIFICATION_MAX_AGE_DAYS:
+                        r.warnings.append(
+                            f"{state}: ratified baseline is >{RATIFICATION_MAX_AGE_DAYS} days old "
+                            f"(ratifiedAt {ratified_at}) — re-verify it still reflects reality.")
             else:
                 r.errors.append(
                     f"{state} camera count {new_count} < 70% of previous {prev_count}, and outside "

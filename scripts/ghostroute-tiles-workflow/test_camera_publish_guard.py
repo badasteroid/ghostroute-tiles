@@ -154,6 +154,35 @@ def test_wrong_schema_warns_not_fails():
     assert any("schema" in w.lower() for w in r.warnings)
 
 
+# ── sanity: the guard must validate its own headline number ─────────────────────
+
+def test_count_mismatch_with_cameras_length_fails():
+    # A "sanity guard" must reject a file whose scalar count disagrees with the actual
+    # cameras array — otherwise count:546 on an emptied cameras:[] sails through.
+    f = _file(3)
+    f["count"] = 500  # lie
+    r = G.evaluate_publish(f, prev_count=490, baselines=_baselines(),
+                           state="ohio", today="2026-09-03")
+    assert not r.ok
+    assert any("count" in e.lower() and ("len" in e.lower() or "match" in e.lower()) for e in r.errors)
+
+
+def test_count_matches_cameras_length_passes():
+    r = G.evaluate_publish(_file(150), prev_count=100, baselines=_baselines(),
+                           state="ohio", today="2026-09-03")
+    assert r.ok and not r.errors
+
+
+def test_future_ratifiedAt_warns_as_future_not_stale():
+    r = G.evaluate_publish(
+        _file(143), prev_count=546,
+        baselines=_baselines("wyoming", 143, "2027-09-03"),  # a typo'd future date
+        state="wyoming", today="2026-09-03")
+    assert r.ok and not r.errors
+    assert any("future" in w.lower() for w in r.warnings)
+    assert not any("180" in w for w in r.warnings)  # must NOT claim ">180 days old"
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

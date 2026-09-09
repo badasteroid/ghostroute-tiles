@@ -43,7 +43,10 @@ jobs:
             --catalog-updated-at "$UPDATED" \
             --catalog-file catalog.json \
             --summary "$GITHUB_STEP_SUMMARY" | tee check-output.txt
-          echo "stale=$?" >> "$GITHUB_OUTPUT"
+          # ${PIPESTATUS[0]} = python's exit, not tee's — self-documenting and robust even if
+          # `set -o pipefail` above is ever dropped (without it, plain $? would be tee's 0 and the
+          # watchdog would never fire). Audited 2026-09-08.
+          echo "stale=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
           set -e
           # Keep the message for the issue body.
           { echo 'body<<EOF'; cat check-output.txt; echo EOF; } >> "$GITHUB_OUTPUT"
