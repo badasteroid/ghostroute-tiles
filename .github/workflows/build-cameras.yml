@@ -139,19 +139,34 @@ jobs:
             --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Publish to cameras-latest release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: cameras-latest
-          files: cameras-${{ matrix.id }}.json
-          # Overwrite the per-state asset in place; the release is a rolling
-          # "latest" pointer, not a versioned tag.
-          # make_latest:false — this DAILY job must NEVER steal GitHub's "Latest"
-          # flag from tiles-latest (the 2026-06-30 hijack: /releases/latest resolved
-          # to the camera release, which has no routing catalog.json, so fresh
-          # installs 404'd and showed "Offline"). Defense-in-depth: the app also pins
-          # fixed tags (cameraCatalogService/routingTilePackService/basemapAssetService),
-          # but every release producer here MUST set this so no one holds Latest by accident.
-          make_latest: false
+        # 2026-09-14: `gh release upload --clobber` in a RETRY loop replaces
+        # softprops/action-gh-release. The 2026-09-13 run lost 16 of 52 states to a
+        # transient GitHub API outage ("Server Error" / HttpError fetching the release)
+        # because the action makes ONE attempt; the same pattern build-tiles.yml already
+        # uses. Overwrites the per-state asset in place — the release is a rolling
+        # "latest" pointer, not a versioned tag. Uploading an asset never touches the
+        # release's "Latest" flag, so the 2026-06-30 hijack (cameras-latest stealing
+        # /releases/latest from tiles-latest — fresh installs 404'd, "Offline") cannot
+        # recur from here; the create fallback below pins --latest=false explicitly.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          R="${{ github.repository }}"
+          if ! gh release view cameras-latest -R "$R" >/dev/null 2>&1; then
+            gh release create cameras-latest -R "$R" --latest=false \
+              --title "ALPR camera extracts (rolling)" \
+              --notes "Rolling per-state camera extracts + cameras-catalog.json. Overwritten daily by build-cameras.yml."
+          fi
+          for attempt in 1 2 3 4 5; do
+            if gh release upload cameras-latest "cameras-${{ matrix.id }}.json" -R "$R" --clobber; then
+              echo "published cameras-${{ matrix.id }}.json (attempt $attempt)"; exit 0
+            fi
+            echo "::warning::${{ matrix.id }}: release upload attempt $attempt failed (GitHub API); retrying in $((attempt * 30)) s."
+            sleep $((attempt * 30))
+          done
+          echo "::error::${{ matrix.id }}: release upload failed after 5 attempts — prior asset retained; catalog job will report coverage."
+          exit 1
 
   catalog:
     needs: [setup, build]
@@ -219,8 +234,20 @@ jobs:
           print(f"catalog written: {len(entries)} states")
           PY
       - name: Publish catalog
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: cameras-latest
-          files: cameras-catalog.json
-          make_latest: false  # never steal "Latest" from tiles-latest (see the release step above)
+        # Same retrying upload as the per-state publish step (2026-09-14); the catalog is
+        # the ONE asset every device gates on, so a transient API error here must not
+        # freeze it. Uploading never touches the release's "Latest" flag.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          R="${{ github.repository }}"
+          for attempt in 1 2 3 4 5; do
+            if gh release upload cameras-latest cameras-catalog.json -R "$R" --clobber; then
+              echo "published cameras-catalog.json (attempt $attempt)"; exit 0
+            fi
+            echo "::warning::catalog upload attempt $attempt failed (GitHub API); retrying in $((attempt * 30)) s."
+            sleep $((attempt * 30))
+          done
+          echo "::error::cameras-catalog.json upload failed after 5 attempts — devices keep the previous catalog; the freshness watchdog will alarm."
+          exit 1
