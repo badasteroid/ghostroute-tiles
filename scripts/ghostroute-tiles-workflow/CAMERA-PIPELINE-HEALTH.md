@@ -138,3 +138,33 @@ Check with:
 in-flight suppression already absorbs the full observed drift range from either slot. **Invariant 8 stands
 as "after a `cron` edit, CONFIRM a run at the new slot" - but cycling the workflow is NOT a proven remedy,
 and the runbook must not claim it is.**
+
+## Runbook addendum 2026-09-14/15 — publish-step retry (GitHub API 5xx) + the cron test is now answered
+
+**Incident.** Run `34747670892` (scheduled, 2026-09-13 08:26 UTC) failed: 16 of 52 `build` jobs died at
+"Publish to cameras-latest release" with GitHub `Server Error` / `HttpError fetching GitHub release` —
+a transient GitHub API outage (08:43–08:51 UTC), not our data or guard. `softprops/action-gh-release`
+makes ONE attempt. Those 16 states kept their prior-day assets, the `catalog` job (`if: always()`) still
+ran and passed the 90 % floor, the watchdog stayed green, and the 09-14 run succeeded 52/52 — so devices
+saw at most a one-day-old asset for 16 states and never a stale catalog. The owner's failure e-mail was
+this run.
+
+**Fix (`22e7681`, mirror `9eaf1f26`).** Both publish steps now run `gh release upload cameras-latest
+<file> --clobber` in a 5-attempt backoff loop (30/60/90/120 s), the pattern `build-tiles.yml` already
+uses; a create fallback pins `--latest=false`. Uploading an asset never touches the release's "Latest"
+flag, so the 2026-06-30 hijack cannot recur from here. **Proof:** `workflow_dispatch` run `34913798068`
+(`states=vermont,wyoming`, 2026-09-15 00:35 UTC) — both state publishes and the catalog publish
+succeeded on the new steps; assets `cameras-vermont.json` / `cameras-wyoming.json` /
+`cameras-catalog.json` updated 00:36–00:37 UTC; the catalog still lists 52 states (50 dated 09-14,
+2 dated 09-15) — a subset dispatch does NOT shrink the catalog. "Latest" is still `basemap-latest`.
+
+**The cron decisive test (addendum above) is ANSWERED: the `23 3 * * *` schedule did NOT re-register.**
+Scheduled fire times since the cycle, UTC: 08:16 (09-09), 08:15 (09-10), 08:10 (09-11), 08:01 (09-12),
+08:26 (09-13), 09:07 (09-14). Over all 21 scheduled runs on record the minimum is 08:00 and none fired
+before it — 9 days after the cron edit, 7 after the cycle. That is the OLD `0 8` slot; +4.8 h drift on
+every single day is not credible when the same repo's watchdog fires within minutes of its slot.
+Cycling the workflow is not a remedy (confirmed). Today's push (`22e7681`) changed the workflow file
+again — the next decisive check is the 2026-09-15 scheduled run: fired ≈03:23–05:00 UTC ⇒ the push
+re-registered it; fired ≥08:00 UTC again ⇒ escalate by moving the schedule to a NEW workflow filename
+(fresh registration), which is the documented community workaround. Still cosmetic (watchdog margin
+covers either slot); Invariant 8 stands.
