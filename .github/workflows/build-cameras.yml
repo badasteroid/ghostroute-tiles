@@ -53,6 +53,26 @@ jobs:
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
     steps:
+      # WHICH CRON FIRED? (2026-09-20) Fire times cannot tell a stale '0 8' registration from a
+      # live '23 3' one: this repo's scheduled runs drift 1.7-5.2 h (watchdog, measured per slot),
+      # so 03:23 + drift and 08:00 + drift both land at ~08:00-08:50 UTC. `github.event.schedule`
+      # is the cron string GitHub actually used — print it, and warn when it is not the one this
+      # file declares. EXPECTED must be kept equal to the `cron:` line above.
+      - name: Which schedule fired this run?
+        if: github.event_name == 'schedule'
+        env:
+          FIRED: ${{ github.event.schedule }}
+          EXPECTED: '23 3 * * *'
+        run: |
+          NOW="$(date -u +%H:%M)"
+          echo "fired by cron '$FIRED' | file declares '$EXPECTED' | job started $NOW UTC"
+          {
+            echo "### Schedule"
+            echo "fired by \`$FIRED\` · file declares \`$EXPECTED\` · job started $NOW UTC"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$FIRED" != "$EXPECTED" ]; then
+            echo "::warning::STALE CRON — GitHub fired this run from '$FIRED' but the workflow declares '$EXPECTED'. See CAMERA-PIPELINE-HEALTH.md."
+          fi
       - uses: actions/checkout@v4
       - id: gen
         run: |

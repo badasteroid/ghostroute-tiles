@@ -23,9 +23,10 @@ and basemaps (`basemap-latest`) are SEPARATE producers on their own cadences. Re
    (`tiles-latest`, `cameras-latest`, `basemap-latest`). GitHub's "Latest" flag auto-moves to the
    newest release, so any producer that omits `make_latest: false` can steal "Latest" from
    `tiles-latest` (the 2026-06-30 hijack: `/releases/latest` resolved to the camera release, which has
-   no `catalog.json`, so fresh installs 404'd → "Offline — waiting for connection"). Both
-   `action-gh-release` steps in `build-cameras.yml` MUST carry `make_latest: false` (restored
-   2026-07-17). The tile and basemap workflows must too.
+   no `catalog.json`, so fresh installs 404'd → "Offline — waiting for connection"). Since
+   2026-09-14 (`22e7681`) `build-cameras.yml` publishes with `gh release upload --clobber`, which
+   never touches the "Latest" flag; its release-create fallback MUST keep `--latest=false`. Any
+   producer still on `action-gh-release` (tile and basemap workflows) MUST carry `make_latest: false`.
 3. **The app pins FIXED tags, never `/releases/latest`.** This is the load-bearing defense (invariant
    2 is defense-in-depth). Verify these stay pinned to `releases/download/<tag>/…`:
    - routing: `src/services/routingTilePackService.ts` `GITHUB_CATALOG_URL` → `tiles-latest/catalog.json`
@@ -158,6 +159,11 @@ succeeded on the new steps; assets `cameras-vermont.json` / `cameras-wyoming.jso
 `cameras-catalog.json` updated 00:36–00:37 UTC; the catalog still lists 52 states (50 dated 09-14,
 2 dated 09-15) — a subset dispatch does NOT shrink the catalog. "Latest" is still `basemap-latest`.
 
+> **⚠️ RETRACTED 2026-09-20 — the paragraph below overclaims. Its conclusion ("ANSWERED: did NOT
+> re-register") rests on a sentence I never measured: "the same repo's watchdog fires within minutes of
+> its slot". That is FALSE — see the 2026-09-20 addendum for the measured drift. The question is OPEN and
+> the "new workflow filename" escalation must NOT be done on this evidence. Kept as the record.**
+
 **The cron decisive test (addendum above) is ANSWERED: the `23 3 * * *` schedule did NOT re-register.**
 Scheduled fire times since the cycle, UTC: 08:16 (09-09), 08:15 (09-10), 08:10 (09-11), 08:01 (09-12),
 08:26 (09-13), 09:07 (09-14). Over all 21 scheduled runs on record the minimum is 08:00 and none fired
@@ -168,3 +174,39 @@ again — the next decisive check is the 2026-09-15 scheduled run: fired ≈03:2
 re-registered it; fired ≥08:00 UTC again ⇒ escalate by moving the schedule to a NEW workflow filename
 (fresh registration), which is the documented community workaround. Still cosmetic (watchdog margin
 covers either slot); Invariant 8 stands.
+
+## Runbook addendum 2026-09-20 — fire times CANNOT answer the cron question; the workflow now reports it
+
+**Correction of my own 2026-09-14/15 claim.** I wrote that the `23 3` schedule "did NOT re-register"
+because a +4.8 h drift "is not credible when the same repo's watchdog fires within minutes of its slot".
+I had not measured the watchdog. Measured now (28 scheduled watchdog runs, `0 */6 * * *`):
+
+| watchdog slot (UTC) | n | drift, hours (min–max) |
+|---|---|---|
+| 00:00 | 7 | 1.92 – 2.18 |
+| 06:00 | 7 | 3.85 – 5.12 |
+| 12:00 | 7 | 2.95 – 5.15 |
+| 18:00 | 7 | 1.70 – 3.12 |
+
+Every scheduled run in this repo is 1.7–5.2 h late, and early-morning slots are the worst. A LIVE
+`23 3` cron + 4.6–5.4 h lands at 08:00–08:49 UTC — exactly where the camera build fires (six more runs
+since: 08:49, 08:43, 08:46, 08:22, 08:10, 08:42 on 09-15…09-20, all after the `22e7681` file push). A
+STALE `0 8` cron + 0–0.8 h lands in the same window. **The two hypotheses predict the same fire times, so
+no number of further runs separates them.** Points each way, neither decisive: two near-exact 08:00 hits
+(08:00:20 on 09-06, 08:01:05 on 09-12) favour the old slot; the repo-wide multi-hour drift favours the
+new one. The earlier "AMBIGUOUS, I am not going to guess" addendum was right and I should not have
+overridden it.
+
+**What actually decides it (`build-cameras.yml`, setup job, step "Which schedule fired this run?").**
+`github.event.schedule` is the cron string GitHub used to fire the run. The step prints it, writes it to
+the run summary, and raises `::warning::STALE CRON` when it differs from the declared `23 3 * * *`
+(`EXPECTED` in that step must be kept equal to the `cron:` line). Read it off the next scheduled run:
+`gh run view <id> -R <repo> --log | grep "fired by cron"`.
+- prints `23 3 * * *` ⇒ the schedule IS live; the ~5 h lateness is GitHub's queue, not a registration
+  bug, and renaming the workflow would fix nothing. If the lateness matters, the lever is a different
+  trigger (e.g. an external dispatcher), not the cron line.
+- prints `0 8 * * *` ⇒ stale registration confirmed; only THEN move the schedule to a new workflow
+  filename (and update the watchdog's `--workflow=build-cameras.yml` in-flight lookup in the same commit).
+
+Still cosmetic either way: the watchdog's 30 h threshold + in-flight suppression covers both slots, and
+there have been no failures and no alarm issues since the 09-13 GitHub outage.
