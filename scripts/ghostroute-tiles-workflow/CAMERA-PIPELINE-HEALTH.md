@@ -210,3 +210,16 @@ the run summary, and raises `::warning::STALE CRON` when it differs from the dec
 
 Still cosmetic either way: the watchdog's 30 h threshold + in-flight suppression covers both slots, and
 there have been no failures and no alarm issues since the 09-13 GitHub outage.
+
+## 2026-09-21 — VERDICT: the `23 3 * * *` schedule IS live; the lateness is GitHub's queue
+
+First instrumented scheduled run `35581627825` (head `00ee4b3`, job started 09:08 UTC):
+`fired by cron '23 3 * * *' | file declares '23 3 * * *'` — no STALE CRON warning. The schedule
+re-registered on the 2026-09-05 edit after all; every 08:00–09:08 UTC fire time since was the `23 3`
+slot plus **4.6–5.8 h of GitHub scheduling delay**, in line with the watchdog's measured 3.9–5.1 h on
+its 06:00 slot. Closed: cycling was never needed (the 09-07/08 addendum was right to doubt it), the
+09-14/15 "did NOT re-register" claim was wrong (retracted above), and the workflow-rename escalation
+is withdrawn for good. The cron line stays; the "Which schedule fired this run?" step stays as the
+permanent instrument (Invariant 8: after any cron edit, read `fired by cron` off the next scheduled
+run instead of inferring from timestamps). If a ~5 h delay ever matters, the lever is an external
+dispatcher (`gh workflow run` from a timer we control), not the cron string.
